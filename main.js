@@ -795,6 +795,8 @@ let menuNeedsPlacement = false;
 let sessionBlurred = false;
 // Shown while oxServe is starting a run
 let startingLabel;
+// Errors from the animation loop that were already logged
+const reportedErrors = new Set();
 let grab;
 // Keeps the structure fixed in the room
 let roomAnchor;
@@ -1391,6 +1393,9 @@ const init = () => {
             get socket() { return ox_socket; },
             get group() { return group; },
             get moveMode() { return moveMode; },
+            get renderer() { return renderer; },
+            get movePanel() { return movePanel; },
+            render,
             controllers: [controller1, controller2],
             forces, startPull, sendForces, releasePull, pollMenuButton, menuAction
         };
@@ -1575,9 +1580,37 @@ function updateCones() {
     }
 }
 
+// The animation loop. three.js only asks for the next frame after this
+// returns, so an exception escaping it would stop the loop for good (in the
+// headset: an empty or frozen scene). Errors are therefore caught, reported
+// once each, and the scene is still drawn.
 function render(time, frame) {
-    const now = performance.now();
+    try {
+        updateFrame(time, frame, performance.now());
+    } catch (error) {
+        reportFrameError(error);
+    }
+    try {
+        renderer.render(scene, camera);
+    } catch (error) {
+        reportFrameError(error);
+    }
+}
 
+// Log each distinct error once, and show the latest in the menu's status
+// line (readable in the headset)
+function reportFrameError(error) {
+    const message = String(error && error.message || error);
+    if (!reportedErrors.has(message)) {
+        reportedErrors.add(message);
+        console.error("Error in the animation loop:", error);
+    }
+    if (movePanel !== undefined) {
+        movePanel.setStatus(`Error: ${message}`.slice(0, 60));
+    }
+}
+
+function updateFrame(time, frame, now) {
     // Place the structure first: held by hand or fixed in the room
     if (renderer.xr.isPresenting) {
         updateHands();
@@ -1613,8 +1646,6 @@ function render(time, frame) {
 
     keyLight.target.position.copy(group.position);
     keyLight.position.copy(group.position).add(KEY_LIGHT_OFFSET);
-
-    renderer.render(scene, camera);
 }
 
 init();

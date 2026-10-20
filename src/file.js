@@ -38,11 +38,13 @@ function makeDatFile (system) {
 
 // got a dat -> set it as the target to interpolate towards
 // (line order is 3'->5', matching the element ids)
+// Show a configuration. Returns false if it is not a complete configuration
+// of this system (nothing is changed then).
 function updateStrandsFromDat(dat_txt, system) {
     if (system === undefined || system.targets === undefined) {
-        return;
+        return false;
     }
-    system.setTargetsFromDat(dat_txt);
+    return system.setTargetsFromDat(dat_txt);
 }
 
 // register drop behavior with a handler function consuming a file list

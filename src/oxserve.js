@@ -68,6 +68,11 @@ export class OXServeSocket extends WebSocket{
         this.worker.postMessage({type: "init", offsets: system.backboneOffsets});
         // A used targets array, handed back to the worker for reuse
         this.spareTargets = undefined;
+        // Frames sent to the worker and not checked yet, in order. A frame
+        // only becomes the latest configuration (used to restart or to
+        // continue after a stop) once the worker has found it complete.
+        this.uncheckedFrames = [];
+        this.nextFrameId = 0;
 
         this.onmessage = (response) => {
             if(!this.abort){ //ignore all incomming messages when we stop the simulation
@@ -76,17 +81,14 @@ export class OXServeSocket extends WebSocket{
                 // restarted. The key precedes the (multi-MB) value, so
                 // this check only scans the start of the message.
                 const header = frameHeader(response.data);
+                const id = this.nextFrameId++;
                 if (header !== undefined) {
-                    this.latestMessage = response.data;
-                    this.lastFrameAt = performance.now();
-                    if (this.starting && (header === this.startHeader ||
-                        this.lastFrameAt - this.startedAt > START_TIMEOUT)) {
-                        this.starting = false;
-                    }
+                    this.uncheckedFrames.push({id, text: response.data, header});
                 }
                 const msg = {
                     type: "message",
                     run: this.run,
+                    id: id,
                     text: response.data,
                     targets: this.spareTargets
                 };
@@ -97,16 +99,36 @@ export class OXServeSocket extends WebSocket{
             }
         };
         this.worker.onmessage = (event) => {
-            const {run, console_log, targets} = event.data;
+            const {run, id, console_log, targets, valid} = event.data;
             if (console_log !== undefined) {
                 console.log(console_log);
             }
-            if (targets !== undefined) {
-                // Drop frames of a stopped or restarted run
-                if (!this.abort && run === this.run) {
-                    system.setTargets(targets);
+            if (targets === undefined) {
+                return;
+            }
+            this.spareTargets = targets;
+            // The checked frame (the worker answers in order)
+            while (this.uncheckedFrames.length > 0 && this.uncheckedFrames[0].id < id) {
+                this.uncheckedFrames.shift();
+            }
+            const frame = this.uncheckedFrames.length > 0 && this.uncheckedFrames[0].id === id ?
+                this.uncheckedFrames.shift() : undefined;
+            if (!valid) {
+                // e.g. read by oxServe while oxDNA was still writing it
+                console.warn("Dropped an incomplete configuration from oxServe");
+                return;
+            }
+            if (frame !== undefined) {
+                this.latestMessage = frame.text;
+                this.lastFrameAt = performance.now();
+                if (this.starting && (frame.header === this.startHeader ||
+                    this.lastFrameAt - this.startedAt > START_TIMEOUT)) {
+                    this.starting = false;
                 }
-                this.spareTargets = targets;
+            }
+            // Drop frames of a stopped or restarted run
+            if (!this.abort && run === this.run) {
+                system.setTargets(targets);
             }
         };
         this.worker.onerror = (error) => {
@@ -116,6 +138,7 @@ export class OXServeSocket extends WebSocket{
             console.log("lost oxServe Connection");
             this.abort = true;
             this.starting = false;
+            this.uncheckedFrames.length = 0;
             this.worker.terminate();
         };
         this.top = top;

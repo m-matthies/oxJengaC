@@ -69,7 +69,11 @@ function parseNumber(str, pos, end) {
 // Parse an oxDNA configuration into backbone positions. Line k after the
 // header is element index k, `offsets` holds its backbone offsets along
 // a1 and a2 (2 per element) and the result is written to `targets`
-// (3 per element). Returns the number of elements read.
+// (3 per element). Returns the number of elements read, which is only
+// targets.length / 3 for a complete, valid configuration of this system:
+// reading stops at the first incomplete or non-finite line (oxServe can
+// send a file oxDNA is still writing), and -1 is returned if there are
+// more lines than elements (a configuration of another system).
 function parseDatTargets(datText, offsets, targets) {
     const len = datText.length;
     const count = targets.length / 3;
@@ -94,6 +98,9 @@ function parseDatTargets(datText, offsets, targets) {
             _parsePos[0] = start;
             for (let k = 0; k < 9; k++) {
                 v[k] = parseNumber(datText, _parsePos, end);
+                if (!Number.isFinite(v[k])) {
+                    return i;
+                }
             }
             // a2 = a1 x a3
             const a2x = v[4] * v[8] - v[5] * v[7];
@@ -106,6 +113,13 @@ function parseDatTargets(datText, offsets, targets) {
             i++;
         }
         start = end + 1;
+    }
+    // Anything but whitespace left: more particles than this system has
+    for (; start < len; start++) {
+        const c = datText.charCodeAt(start);
+        if (c !== 32 && c !== 9 && c !== 10 && c !== 13) {
+            return -1;
+        }
     }
     return i;
 }

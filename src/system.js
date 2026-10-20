@@ -119,9 +119,18 @@ class System {
     // target. Line k of the configuration maps to the element with index k.
     // Used for dropped files; streamed frames are parsed in a worker and
     // arrive through setTargets().
+    // Returns false (and changes nothing) if the configuration is incomplete
+    // or does not belong to this system.
     setTargetsFromDat(datText, now = performance.now()) {
-        parseDatTargets(datText, this.backboneOffsets, this.targets);
-        this._startInterpolation(now);
+        if (this._parsedTargets === undefined) {
+            this._parsedTargets = new Float32Array(this.targets.length);
+        }
+        const count = this.targets.length / 3;
+        if (parseDatTargets(datText, this.backboneOffsets, this._parsedTargets) !== count) {
+            return false;
+        }
+        this.setTargets(this._parsedTargets, now);
+        return true;
     }
 
     // Set new interpolation targets (backbone positions, 3 per element
@@ -203,6 +212,11 @@ class System {
             const k = 3 * i;
             const x = m[o], y = m[o + 1], z = m[o + 2];
             const tx = t[k], ty = t[k + 1], tz = t[k + 2];
+            // A single non-finite value would make the sphere NaN, and the
+            // whole structure would be culled
+            if (!Number.isFinite(x + y + z + tx + ty + tz)) {
+                continue;
+            }
             minX = Math.min(minX, x, tx);
             maxX = Math.max(maxX, x, tx);
             minY = Math.min(minY, y, ty);

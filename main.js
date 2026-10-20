@@ -1128,7 +1128,10 @@ const init = () => {
         // assuming we got one file
         // -> simple parser test
         files[0].text().then(text => {
-            updateStrandsFromDat(text, system);
+            if (!updateStrandsFromDat(text, system)) {
+                console.warn("Dropped file is not a complete configuration of this structure");
+                return;
+            }
             // Continue (or later start) the simulation from the dropped
             // configuration
             continueFrom(text, forceString());

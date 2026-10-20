@@ -8,7 +8,9 @@
 //                            simulation run `run`, optionally with a used
 //                            targets array to reuse (transferred)
 // Messages out:
-//   {run, console_log?, targets?}
+//   {run, id, console_log?, targets?, valid?}  `valid` is false for an
+//                            incomplete or broken configuration (targets
+//                            then only come back for reuse)
 // The dat text itself is not sent back (it would be a multi-MB copy); the
 // main thread keeps the raw message and only parses it for a restart.
 
@@ -24,7 +26,7 @@ self.onmessage = (event) => {
         break;
     case "message": {
         const message = JSON.parse(msg.text);
-        const reply = {run: msg.run};
+        const reply = {run: msg.run, id: msg.id};
         const transfer = [];
         if ("console_log" in message) {
             reply.console_log = message["console_log"];
@@ -35,7 +37,8 @@ self.onmessage = (event) => {
             if (targets === undefined || targets.length !== 3 * count) {
                 targets = new Float32Array(3 * count);
             }
-            parseDatTargets(message["dat_file"], offsets, targets);
+            reply.valid =
+                parseDatTargets(message["dat_file"], offsets, targets) === count;
             reply.targets = targets;
             transfer.push(targets.buffer);
         }

@@ -19,6 +19,20 @@ import {
     Strand, System
 } from "./src/system.js";
 
+// Reused scratch objects for controller picking and cone updates
+const _ray = new THREE.Ray();
+const _hit = {};
+const _rotation = new THREE.Matrix4();
+const _beadPos = new THREE.Vector3();
+
+// Find the bead the controller is pointing at
+function pickFromController(controller) {
+    _rotation.identity().extractRotation(controller.matrixWorld);
+    _ray.origin.setFromMatrixPosition(controller.matrixWorld);
+    _ray.direction.set(0, 0, -1).applyMatrix4(_rotation);
+    return system.pick(_ray, _hit);
+}
+
 function onSelectStart(event) {
 
     // Do not select things if there is no system
@@ -27,58 +41,44 @@ function onSelectStart(event) {
     }
 
     const controller = event.target;
-    const intersections = getIntersections(controller);
+    const hit = pickFromController(controller);
 
-    if (intersections.length == 0) {
+    if (hit === undefined) {
+        // Pointing at nothing releases this controller's pull
         if (forces.has(controller)) {
-            const f = forces.get(controller);
-            scene.remove(f.coneMesh);
+            controller.userData.cone.visible = false;
             forces.delete(controller);
         }
-    }
+    } else {
+        controller.userData.selected = hit.index;
 
-    for (const intersection of intersections) {
-        if (!intersection.object.isInstancedMesh) {
-            continue;
-        }
-        const object = intersection.object;
-        controller.userData.selected = object;
-        controller.userData.selectedId = intersection.instanceId;
-
-        console.log("Selected id " + intersection.instanceId);
-
-        // Get position of the selected nucleotide
-        const nucPos = system.elements.get(intersection.instanceId).position;
+        console.log("Selected particle " + hit.index);
 
         // Get controller position
         const target = controller.position.clone();
 
-        if (forces.has(controller)) {
-            // Remove old cone mesh
-            const f = forces.get(controller);
-            scene.remove(f.coneMesh);
-        }
-
-        // Draw a "tractor beam" cone
-        const pullArrow = drawCone(target, nucPos, controllerColors[controller.name]);
-        scene.add(pullArrow);
+        // Show the "tractor beam" cone
+        const cone = controller.userData.cone;
+        cone.visible = true;
+        positionCone(cone, target, hit.point);
 
         // Convert to oxDNA coordinates
         let oxDNATarget = system.instancedMesh.worldToLocal(target.clone());
 
-        console.log(`Pull particle ${intersection.instanceId} at ${nucPos.toArray().map(v => v.toFixed(3))
-        } toward ${oxDNATarget.toArray()}`);
+        console.log(`Pull particle ${hit.index} toward ${oxDNATarget.toArray()}`);
 
         forces.set(controller, {
-            coneMesh: pullArrow,
             target: target,
             oxDNATarget: oxDNATarget,
-            nucId: intersection.instanceId
+            nucId: hit.index
         });
-
-        break;
     }
 
+    sendForces();
+}
+
+// Send the current pulls to oxDNA as trap forces
+function sendForces() {
     let forceStr = [...forces.values()].map(f =>
         `
         {
@@ -95,14 +95,25 @@ function onSelectStart(event) {
 
     // Send new forces to oxDNA
     ox_socket.update_forces(forceStr);
-
-    render();
-
 }
 
 function onSelectEnd(event) {
     const controller = event.target;
     controller.userData.selected = undefined;
+}
+
+// Let go of everything, e.g. when the XR session ends (no selectend fires
+// then, even if a trigger is held)
+function releaseAllPulls() {
+    for (const c of [controller1, controller2]) {
+        c.userData.cone.visible = false;
+        c.userData.selected = undefined;
+        setHighlight(c, undefined);
+    }
+    if (forces.size > 0) {
+        forces.clear();
+        sendForces();
+    }
 }
 
 let container;
@@ -112,20 +123,12 @@ let controllerGrip1, controllerGrip2;
 
 const forces = new Map();
 
-let raycaster;
-const intersected = [];
-const tempMatrix = new THREE.Matrix4();
-
 let controls, group;
 
 // my oxDNA related mess
 let box;
 let system;
 let ox_socket;
-
-let stepCounter = 0;
-let frameCounter = 0;
-let framesSinceLastStep = 0;
 
 const targetScale = new THREE.Vector3(1/50, 1/50, 1/50);
 
@@ -150,19 +153,12 @@ const initSceneFromJSON = (txt) => {
         n_monomers += strand.monomers.length;
     });
 
-    // make sure we have no items in the scene group
-    while (group.children.length > 0) {
-        let child = group.children[0];
-        group.remove(child);
-        // Optional: Dispose geometry and material if they are no longer needed
-        if (child.geometry) child.geometry.dispose();
-        if (child.material) child.material.dispose();
-    }
-
-    system = new System(box);
+    // Build the new system first, so that a design that fails to parse
+    // leaves the current one running
+    const newSystem = new System(box);
     strands.forEach(strandData => {
-        const strand = new Strand(system, strandData.id);
-        system.strands.push(strand);
+        const strand = new Strand(newSystem, strandData.id);
+        newSystem.strands.push(strand);
         strandData.monomers.forEach(monomerData => {
             let monomerClass;
             switch (monomerData.class) {
@@ -173,7 +169,7 @@ const initSceneFromJSON = (txt) => {
                 throw new Error(`Unrecognised type of element:  ${monomerData.class}`);
             }
 
-            if (system.elements.has(monomerData.id)) {
+            if (newSystem.elements.has(monomerData.id)) {
                 throw "Differing id handling not inplemented yet";
             }
             const monomer = new monomerClass(
@@ -189,18 +185,43 @@ const initSceneFromJSON = (txt) => {
     });
     strands.forEach(strandData => {
         strandData.monomers.forEach(monomerData => {
-            const monomer = system.elements.get(monomerData.id);
-            monomer.n5 = system.elements.get(monomerData.n5);
-            monomer.n3 = system.elements.get(monomerData.n3);
-            monomer.pair = system.elements.get(monomerData.bp);
+            const monomer = newSystem.elements.get(monomerData.id);
+            monomer.n5 = newSystem.elements.get(monomerData.n5);
+            monomer.n3 = newSystem.elements.get(monomerData.n3);
+            monomer.pair = newSystem.elements.get(monomerData.bp);
         });
     });
-    system.placeInBox();
+    newSystem.placeInBox();
+    newSystem.assignIndices();
 
-    system.createViewMesh();
-    //const com = system.getCenterOfMass();
-    //system.instancedMesh.position.add(com);
+    newSystem.createViewMesh();
 
+    // Drop everything that belongs to the previous system
+    if (ox_socket !== undefined) {
+        // Stop the server-side run before disconnecting
+        ox_socket.shutdown();
+    }
+    if (system !== undefined) {
+        system.dispose();
+    }
+    for (const c of [controller1, controller2]) {
+        c.userData.cone.visible = false;
+        // Highlights belonged to the old system's colours
+        c.userData.highlighted = undefined;
+        c.userData.selected = undefined;
+    }
+    forces.clear();
+
+    // make sure we have no items in the scene group
+    while (group.children.length > 0) {
+        let child = group.children[0];
+        group.remove(child);
+        // Optional: Dispose geometry and material if they are no longer needed
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+    }
+
+    system = newSystem;
     group.add(system.instancedMesh);
 
     const axesHelper = new THREE.AxesHelper(10);
@@ -220,10 +241,7 @@ const initSceneFromJSON = (txt) => {
 
     // Establish oxServe connection and update cycles here
     ox_socket = establishConnection(
-        system, top_file, dat_file, () => {
-            framesSinceLastStep = 0;
-            stepCounter++;
-        },
+        system, top_file, dat_file,
         // TODO: Check more than just one monomer
         system.strands[0].monomers[0].getCategory()
     );
@@ -246,12 +264,16 @@ const init = () => {
         // -> simple parser test
         files[0].text().then(text => {
             updateStrandsFromDat(text, system);
+            // Continue the simulation from the dropped configuration
+            if (ox_socket !== undefined) {
+                ox_socket.load_dat(text);
+            }
         });
     });
 
     scene = new THREE.Scene();
 
-    scene.background = new THREE.Color(0x00000, 0);
+    scene.background = new THREE.Color(0x000000);
 
     camera = new THREE.PerspectiveCamera(
         50, window.innerWidth / window.innerHeight, 0.1, 100
@@ -284,7 +306,8 @@ const init = () => {
             this.counter = 0;
 
             this.designs = [
-                "monohole_1b.oxview",
+                "flippy.oxview",
+                //"monohole_1b.oxview",
                 //"6-bar.oxview",
                 //"hairygami.oxview",
                 //"hairpin.oxview",
@@ -321,11 +344,6 @@ const init = () => {
 
     let designStorage = new DesignStorage();
 
-    //load up first design
-    fetch(designStorage.getCurrent()).then(
-        resp => resp.text()
-    ).then(initSceneFromJSON);
-
     // read from nanobase might be subject to XSSS scripting issues ...
     // need to look more into it, but even oxview.org can't fetch in local
     // dev cycle
@@ -351,6 +369,14 @@ const init = () => {
     renderer.xr.addEventListener("sessionstart", ()=>{
         // Set small initial scale (actual oxDNA scale)
         group.scale.multiplyScalar(8.518E-10);
+    });
+
+    renderer.xr.addEventListener("sessionend", ()=>{
+        // Controllers are no longer tracked, so release their pulls and
+        // highlights
+        if (system !== undefined) {
+            releaseAllPulls();
+        }
     });
 
     document.body.appendChild(XRButton.createButton(renderer, {
@@ -386,14 +412,10 @@ const init = () => {
 
     controller1 = renderer.xr.getController(0);
     controller1.name="left";
-    controller1.addEventListener("selectstart", onSelectStart);
-    controller1.addEventListener("selectend", onSelectEnd);
     scene.add(controller1);
 
     controller2 = renderer.xr.getController(1);
     controller2.name="right";
-    controller2.addEventListener("selectstart", onSelectStart);
-    controller2.addEventListener("selectend", onSelectEnd);
     scene.add(controller2);
 
     const controllerModelFactory = new XRControllerModelFactory();
@@ -416,6 +438,17 @@ const init = () => {
     ]);
 
     [controller1, controller2].forEach(c=>{
+        c.addEventListener("selectstart", onSelectStart);
+        c.addEventListener("selectend", onSelectEnd);
+
+        // Keep the input source, for haptic feedback
+        c.addEventListener("connected", e => {
+            c.userData.inputSource = e.data;
+        });
+        c.addEventListener("disconnected", () => {
+            c.userData.inputSource = undefined;
+        });
+
         const line = new THREE.Line(
             geometry,
             new THREE.LineBasicMaterial({
@@ -425,11 +458,26 @@ const init = () => {
         line.name = "line";
         line.scale.z = 5;
         c.add(line);
+        c.userData.line = line;
+
+        // One reusable "tractor beam" cone per controller
+        const cone = drawCone(
+            new THREE.Vector3(), new THREE.Vector3(0, 0, -1),
+            controllerColors[c.name]
+        );
+        cone.visible = false;
+        scene.add(cone);
+        c.userData.cone = cone;
     });
 
-    raycaster = new THREE.Raycaster();
-
     window.addEventListener("resize", onWindowResize);
+
+    //load up first design
+    fetch(designStorage.getCurrent()).then(
+        resp => resp.text()
+    ).then(initSceneFromJSON);
+
+    renderer.setAnimationLoop(render);
 };
 
 const onWindowResize = () => {
@@ -439,171 +487,86 @@ const onWindowResize = () => {
 
 };
 
-function getIntersections(controller) {
-
-    tempMatrix.identity().extractRotation(controller.matrixWorld);
-
-    raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
-    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
-    return raycaster.intersectObjects(group.children, false);
+// Change which bead a controller highlights. Only touches the colours
+// when the highlighted bead actually changes.
+function setHighlight(controller, index) {
+    const previous = controller.userData.highlighted;
+    if (previous === index) {
+        return;
+    }
+    controller.userData.highlighted = index;
+    if (previous !== undefined) {
+        system.setHighlighted(previous, false);
+    }
+    if (index !== undefined) {
+        system.setHighlighted(index, true);
+    }
 }
 
+function pulse(controller) {
+    const source = controller.userData.inputSource;
+    if (
+        source &&
+        source.gamepad &&
+        source.gamepad.hapticActuators &&
+        source.gamepad.hapticActuators[0]
+    ) {
+        source.gamepad.hapticActuators[0].pulse(0.4, 20);
+    }
+}
 
-function intersectObjects(controller) {
+function updateHover(controller) {
 
     // Do not highlight when already selected
-    // Do not check intersections when there is no system
-    if (system === undefined ||
-        controller.userData.selected !== undefined
-    ) {
+    if (controller.userData.selected !== undefined) {
+        setHighlight(controller, undefined);
         return;
     }
 
-    const line = controller.getObjectByName("line");
-    const intersections = getIntersections(controller);
+    const line = controller.userData.line;
+    const hit = pickFromController(controller);
 
-    if (intersections.length === 0) {
+    if (hit === undefined) {
         line.scale.z = 5;
-        controller.userData.highlighted = undefined;
-    }
-    for (const intersection of intersections) {
-        if (!intersection.object.isInstancedMesh) {
-            continue;
-        }
-
-        const session = renderer.xr.getSession();
-        if (
-            session && //only if we are in a webXR session
-            // And need for a continuous haptic pulse
-            intersection.instanceId === controller.userData.highlighted) {
-            for (const sourceXR of session.inputSources) {
-                if (!sourceXR.gamepad) continue;
-                if (
-                    sourceXR &&
-                    sourceXR.gamepad &&
-                    sourceXR.gamepad.hapticActuators &&
-                    sourceXR.gamepad.hapticActuators[0] &&
-                    sourceXR.handedness == controller.name
-                ) {
-                    sourceXR.gamepad.hapticActuators[0].pulse(0.4, 20);
-                }
-            }
-        }
-
-        const object = intersection.object;
-        const color = new THREE.Color();
-        object.getColorAt(intersection.instanceId, color);
-        color.multiplyScalar(1 / 3);
-        object.setColorAt(intersection.instanceId, color);
-        object.instanceColor.needsUpdate = true;
-        intersected.push([intersection.instanceId, object]);
-        line.scale.z = intersection.distance;
-
-        controller.userData.highlighted = intersection.instanceId;
-
-        break;
+        setHighlight(controller, undefined);
+        return;
     }
 
+    // Continuous haptic pulse while pointing at the same bead
+    if (hit.index === controller.userData.highlighted) {
+        pulse(controller);
+    }
+
+    setHighlight(controller, hit.index);
+    line.scale.z = hit.distance;
 }
 
-function cleanIntersected() {
-    const color = new THREE.Color();
-    while (intersected.length) {
-        const [instanceId, object] = intersected.pop();
-        object.getColorAt(instanceId, color);
-        color.multiplyScalar(3);
-        object.setColorAt(instanceId, color);
-        object.instanceColor.needsUpdate = true;
+// Point each pull cone from its target to the pulled bead
+function updateCones() {
+    for (const [controller, f] of forces) {
+        system.getDisplayedPosition(f.nucId, _beadPos);
+        system.instancedMesh.localToWorld(_beadPos);
+        positionCone(controller.userData.cone, f.target, _beadPos);
     }
-
 }
-
 
 function render() {
+    if (system !== undefined && system.instancedMesh !== undefined) {
+        system.updateView(performance.now());
+        if (forces.size > 0) {
+            updateCones();
+        }
 
-    cleanIntersected();
-
-    intersectObjects(controller1);
-    intersectObjects(controller2);
+        // Controllers only exist in an XR session
+        if (renderer.xr.isPresenting) {
+            updateHover(controller1);
+            updateHover(controller2);
+        }
+    }
 
     group.scale.lerp(targetScale, 0.01);
 
     renderer.render(scene, camera);
-
-    const pulledParticles = new Set([...forces.values()].map(f => f.nucId));
-
-    if (system !== undefined &&
-        system.instancedMesh !== undefined &&
-        system.elements.get(0).targetPosition !== undefined
-    ) {
-        const dummy = new THREE.Object3D();
-        const current = new THREE.Vector3();
-        const target = new THREE.Vector3();
-        const m = new THREE.Matrix4();
-
-        frameCounter++;
-        framesSinceLastStep++;
-
-        // Overestimate a bit
-        const framesPerStep = 1.2 * (
-            (frameCounter - framesSinceLastStep) / stepCounter
-        );
-
-        // Calculate how much to lerp this step to have linear interpolation
-        let lerpFrac = Math.max(0, Math.min(1,
-            (1 / (framesPerStep - framesSinceLastStep))
-        ));
-
-        if (isNaN(lerpFrac)) {
-            lerpFrac = 1;
-        }
-
-        // idCounter is the highest id in use, so it is included
-        for (let i=0; i<=system.idCounter; i++) {
-            if (!system.elements.has(i)) {
-                // Hide instance if element doesn't exist
-                system.instancedMesh.setMatrixAt(
-                    i, new THREE.Matrix4().makeScale(0, 0, 0)
-                );
-                continue;
-            }
-            const e = system.elements.get(i);
-
-            // Get current position
-            system.instancedMesh.getMatrixAt(i, m);
-            current.setFromMatrixPosition(m);
-
-            // Get target
-            e.getTargetBackbonePos(target);
-
-            // Lerp towards new position
-            current.lerp(target, lerpFrac);
-
-            if (pulledParticles.has(i)) {
-                for (const f of forces.values()) {
-                    if (f.nucId === i) {
-                        positionCone(
-                            f.coneMesh,
-                            f.target,
-                            system.instancedMesh.localToWorld(current.clone())
-                        );
-                    }
-                }
-            }
-
-            // Update instance matrix
-            dummy.position.copy(current);
-            dummy.updateMatrix();
-            system.instancedMesh.setMatrixAt(i, dummy.matrix);
-        }
-        system.instancedMesh.instanceMatrix.needsUpdate = true;
-        // The raycaster culls against a cached bounding sphere, so keep it
-        // in sync with the moving instances
-        system.instancedMesh.computeBoundingSphere();
-    }
-
-    renderer.setAnimationLoop(render);
 }
 
 init();
-render();

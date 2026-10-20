@@ -1,21 +1,19 @@
-import * as THREE from "three";
-
 // Super-crude transform of oxview json -> top
+// Lines (and neighbour references) use the element indices from
+// system.assignIndices(), never the oxView ids
 function makeTopFile(system) {
+    const strandNumbers = new Map(system.strands.map((s, i) => [s, i + 1]));
     let lines = [];
     // Header
     lines.push(`${system.getSize()} ${system.strands.length}`);
     // Add the nucleotides
-    system.strands.forEach(strand => {
-        // Generate all the monomer lines
-        strand.monomers.slice().reverse().forEach(m => {
-            lines.push([
-                strand.id + 1,
-                m.type,
-                m.n3 === undefined ? -1 : m.n3.id,
-                m.n5 === undefined ? -1 : m.n5.id
-            ].join(" "));
-        });
+    system.monomersByIndex.forEach(m => {
+        lines.push([
+            strandNumbers.get(m.strand),
+            m.type,
+            m.n3 === undefined ? -1 : m.n3.index,
+            m.n5 === undefined ? -1 : m.n5.index
+        ].join(" "));
     });
     // spit out the text
     return lines.join("\n");
@@ -23,47 +21,28 @@ function makeTopFile(system) {
 
 // fast transform of oxview json -> dat
 function makeDatFile (system) {
-    // header 
+    // header
     let lines = [
         "t = 0",
         `b = ${system.box.x} ${system.box.y} ${system.box.z}`,
         "E = 0 0 0"
     ];
-    // make sure to catch 3->5 whilst we go through the strands 
-    system.strands.forEach(strand => {
-        strand.monomers.slice().reverse().forEach(base => {
-            lines.push([...[
-                base.position, base.a1, base.a3
-            ].flatMap(v=>v.toArray()), 0, 0, 0, 0, 0, 0].join(" "));
-        });
+    // same 3->5 order as the topology
+    system.monomersByIndex.forEach(base => {
+        lines.push([...[
+            base.position, base.a1, base.a3
+        ].flatMap(v=>v.toArray()), 0, 0, 0, 0, 0, 0].join(" "));
     });
     return lines.join("\n");
 }
 
-// got a dat -> update our model 
-// currently meshes live 3->5 
-// aaaargh
+// got a dat -> set it as the target to interpolate towards
+// (line order is 3'->5', matching the element ids)
 function updateStrandsFromDat(dat_txt, system) {
-    let lines = dat_txt.split("\n");
-
-    const header_offset = 3;
-    const line_count = lines.length;
-    for (let i = header_offset; i < line_count; i++) {
-        if (lines[i] === "") {
-            continue;
-        }
-        let line = lines[i].split(" ").map(parseFloat);
-
-        let p = new THREE.Vector3(line[0], line[1], line[2]);
-        //let a1 = new THREE.Vector3(line[3], line[4], line[5]);
-        //let a3 = new THREE.Vector3(line[4], line[5], line[6]);
-        //let a2 = a1.clone().cross(a3);
-
-        // Set a target position to lerp towards in the animation loop
-        const monomer = system.elements.get(i - header_offset);
-        monomer.position = monomer.targetPosition;
-        monomer.targetPosition = p;
+    if (system === undefined || system.targets === undefined) {
+        return;
     }
+    system.setTargetsFromDat(dat_txt);
 }
 
 // register drop behavior with a handler function consuming a file list

@@ -46,7 +46,7 @@ function drawCone(from, to, color=0xffff00, radius=0.015, radialSegments=6) {
 }
 
 function positionCone(cone, from, to) {
-    cone.position.copy(to.clone().add(from).divideScalar(2));
+    cone.position.addVectors(to, from).multiplyScalar(0.5);
     cone.scale.z = to.distanceTo(from);
     cone.lookAt(from);
 }

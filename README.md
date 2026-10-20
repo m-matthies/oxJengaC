@@ -8,6 +8,7 @@ The app is built with [Vite](https://vitejs.dev/):
 ```
 npm install
 npm run dev      # dev server, also exposed on the local network
+npm run dev:https  # same over HTTPS (self-signed), needed for WebXR on a headset
 npm run build    # production build in dist/
 npm run preview  # serve the production build
 npm run deploy   # build and publish to GitHub Pages (gh-pages branch)

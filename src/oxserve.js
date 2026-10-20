@@ -1,7 +1,6 @@
-import { updateStrandsFromDat } from "./file.js";
 import {dna_relax_scenario, rna_relax_scenario} from "./relax_scenarios.js";
 export class OXServeSocket extends WebSocket{
-    constructor(url, system, top, dat, onUpdate, type="DNA") {
+    constructor(url, system, top, dat, type="DNA") {
         super(url);
 
         switch (type) {
@@ -17,6 +16,11 @@ export class OXServeSocket extends WebSocket{
         }
 
         this.abort = true;
+        // No traps to begin with
+        this.forces = "";
+        // Incremented on every (re)start, so that frames of an aborted run
+        // still being parsed in the worker can be told apart
+        this.run = 0;
 
         this.onopen = (resonse) => {
             console.log("connected to nanobase", resonse);
@@ -28,26 +32,71 @@ export class OXServeSocket extends WebSocket{
             console.log("WebSocket error: ", resonse);
         };
 
+        // JSON and dat parsing happen in a worker, off the main thread
+        this.worker = new Worker(
+            new URL("./datWorker.js", import.meta.url), {type: "module"}
+        );
+        this.worker.postMessage({type: "init", offsets: system.backboneOffsets});
+        // A used targets array, handed back to the worker for reuse
+        this.spareTargets = undefined;
+
         this.onmessage = (response) => {
             if(!this.abort){ //ignore all incomming messages when we stop the simulation
-                let message = JSON.parse(response.data);
-                if ("console_log" in message){
-                    console.log(message["console_log"]);
+                // Keep a reference to the newest configuration message, it
+                // is only parsed here if the simulation needs to be
+                // restarted. The key precedes the (multi-MB) value, so
+                // this check only scans the start of the message.
+                if (response.data.indexOf("\"dat_file\"") !== -1) {
+                    this.latestMessage = response.data;
                 }
-                if ("dat_file" in message) {
-                    onUpdate();
-                    this.dat = message["dat_file"];
-                    updateStrandsFromDat(message["dat_file"], system);
-                }
+                const msg = {
+                    type: "message",
+                    run: this.run,
+                    text: response.data,
+                    targets: this.spareTargets
+                };
+                this.spareTargets = undefined;
+                this.worker.postMessage(
+                    msg, msg.targets ? [msg.targets.buffer] : []
+                );
             }
+        };
+        this.worker.onmessage = (event) => {
+            const {run, console_log, targets} = event.data;
+            if (console_log !== undefined) {
+                console.log(console_log);
+            }
+            if (targets !== undefined) {
+                // Drop frames of a stopped or restarted run
+                if (!this.abort && run === this.run) {
+                    system.setTargets(targets);
+                }
+                this.spareTargets = targets;
+            }
+        };
+        this.worker.onerror = (error) => {
+            console.error("oxServe worker error: ", error);
         };
         this.onclose = () => {
             console.log("lost oxServe Connection");
             this.abort = true;
+            this.worker.terminate();
         };
         this.top = top;
         this.dat = dat;
 
+    }
+
+    // The newest configuration received, to restart the simulation from
+    get_latest_dat() {
+        if (this.latestMessage !== undefined) {
+            const message = JSON.parse(this.latestMessage);
+            this.latestMessage = undefined;
+            if ("dat_file" in message) {
+                this.dat = message["dat_file"];
+            }
+        }
+        return this.dat;
     }
 
     stop_simulation() {
@@ -74,16 +123,25 @@ export class OXServeSocket extends WebSocket{
             return;
         }
         this.abort = false;
+        this.run++;
         let conf = {};
         conf["settings"] = this.relax_scenario;
-        if (this.forces !== undefined) {
+        if (this.forces !== "") {
             conf["trap_file"] = this.forces;
         }
         conf["top_file"] = this.top;
-        conf["dat_file"] = this.dat;
+        conf["dat_file"] = this.get_latest_dat();
         this.send(
             JSON.stringify(conf)
         );
+    }
+
+    // Abort the current run and start again from the latest configuration
+    restart_simulation() {
+        if (this.readyState === WebSocket.OPEN) {
+            this.send("abort");
+        }
+        this.start_simulation();
     }
 
     update_forces(forces) {
@@ -92,15 +150,26 @@ export class OXServeSocket extends WebSocket{
             return;
         }
         this.forces = forces;
-        if (this.readyState === WebSocket.OPEN) {
-            this.send("abort");
-        }
         // Restart from the latest configuration with the new forces
-        this.start_simulation();
+        this.restart_simulation();
+    }
+
+    // Continue the simulation from a given configuration (e.g. a dropped
+    // dat file)
+    load_dat(dat) {
+        this.dat = dat;
+        this.latestMessage = undefined;
+        this.restart_simulation();
+    }
+
+    // Stop the server-side run before disconnecting
+    shutdown() {
+        this.stop_simulation();
+        this.close();
     }
 }
- 
-export const establishConnection = (system, top_file, dat_file, onUpdate, type) => {
+
+export const establishConnection = (system, top_file, dat_file, type) => {
     const url = "wss://nanobase.org:8989";
-    return  new OXServeSocket(url, system, top_file, dat_file, onUpdate, type);
+    return  new OXServeSocket(url, system, top_file, dat_file, type);
 };

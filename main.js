@@ -96,8 +96,8 @@ function updateDesignMenu() {
     movePanel.setDesign(designName(selectedDesign), selectedDesign === loadedDesign);
 }
 
-// Fetch and show a design, and start simulating it. The current one keeps
-// running until the new one has been parsed.
+// Fetch and show a design (and simulate it, if the simulation is on). The
+// current one stays until the new one has been parsed.
 function loadDesign(index) {
     const id = ++designLoadId;
     const name = designName(index);
@@ -131,6 +131,12 @@ function loadDesign(index) {
 // Y, plus anything after the thumbrest (where some runtimes report the
 // menu button)
 const isMenuButton = (i) => i === 4 || i === 5 || i >= 7;
+// Minimum time (ms) between two toggles of the menu, so that one press (or
+// the system's own report of the hand gesture) toggles it once
+const MENU_TOGGLE_COOLDOWN = 350;
+let lastMenuToggle = -Infinity;
+// Minimum time (ms) between two pokes of one fingertip
+const POKE_COOLDOWN = 250;
 
 // Reused scratch objects for controller picking and cone updates
 const _ray = new THREE.Ray();
@@ -256,13 +262,13 @@ function inputPosition(controller) {
     return controller.position;
 }
 
-// What a controller pokes with: a hand's index finger tip, or the
-// controller itself
+// What pokes the menu: a hand's index finger tip. Controllers use their
+// ray and trigger instead (poking with them pressed buttons by accident).
 function pokeTip(controller) {
     if (isHand(controller)) {
         return jointPosition(controller.userData.hand, "index-finger-tip");
     }
-    return controller.userData.inputSource ? controller.position : undefined;
+    return undefined;
 }
 
 // The bead within reach of a hand's pinch point, if any
@@ -290,7 +296,7 @@ function startPull(controller, index, target) {
     // is pulled to the target.
     const offsets = new Float32Array(3 * particles.length);
     const picked = particles.indexOf(index);
-    if (readPositions(ox_socket.get_latest_dat(), particles, offsets) === particles.length) {
+    if (readPositions(latestDat(), particles, offsets) === particles.length) {
         const cx = offsets[3 * picked];
         const cy = offsets[3 * picked + 1];
         const cz = offsets[3 * picked + 2];
@@ -322,53 +328,98 @@ function startPull(controller, index, target) {
     updateCones();
 }
 
-// Send the current pulls to oxDNA as trap forces
-function sendForces() {
-    const forceStr = [...forces.values()].map(f => f.particles.map(
+// The current pulls as an oxDNA trap file
+function forceString() {
+    return [...forces.values()].map(f => f.particles.map(
         (i, k) => trapBlock(
             i, _trapPos.fromArray(f.offsets, 3 * k).add(f.oxDNATarget), f.stiff
         )
     ).join("\n")).join("\n");
+}
 
+// The latest configuration: from the running simulation, or the one it
+// will continue from when started
+function latestDat() {
+    if (ox_socket !== undefined) {
+        return ox_socket.get_latest_dat();
+    }
+    return stoppedDat ?? initialDat;
+}
+
+// Send the current pulls to oxDNA as trap forces. Without a simulation
+// they take effect when it is started.
+function sendForces() {
+    // Off, or about to connect (which sends the current pulls anyway)
+    if (!simulationOn || ox_socket === undefined) {
+        return;
+    }
+    const forceStr = forceString();
     if (forceStr === ox_socket.forces && !connectionLost()) {
         console.log("Forces do not need to be updated");
         return;
     }
-    restartSimulation(ox_socket.get_latest_dat(), forceStr);
+    continueFrom(ox_socket.get_latest_dat(), forceStr);
 }
 
-// Restart the simulation from `dat` with the given trap forces, on a fresh
-// oxServe connection. oxServe kills the old run, but frames the dying run
-// still sends would arrive on the old connection: shown, they would move
-// the structure on without the new forces and then snap it back when the
-// new run starts from `dat`. A fresh connection never receives them, so
-// the structure holds still until the new run starts.
+// Continue the simulation from `dat` with the given trap forces. If it is
+// off, `dat` is just kept for the next start. If it is on, it is restarted
+// on a fresh oxServe connection: oxServe kills the old run, but frames the
+// dying run still sends would arrive on the old connection, and shown, they
+// would move the structure on without the new forces and then snap it back
+// when the new run starts from `dat`. A fresh connection never receives
+// them, so the structure holds still until the new run starts.
 //
-// The new connection is only opened once the old one has closed (or after
-// RESTART_CLOSE_WAIT), so that oxServe never counts both against its
-// connection limit. A restart requested meanwhile replaces the pending one.
-function restartSimulation(dat, forceStr) {
+// A restart requested while one is pending replaces it.
+function continueFrom(dat, forceStr) {
+    if (!simulationOn) {
+        stoppedDat = dat;
+        return;
+    }
     const waiting = pendingRestart !== undefined;
     pendingRestart = {dat, forceStr};
     if (waiting) {
         return;
     }
     const old = ox_socket;
-    const go = () => {
-        if (pendingRestart === undefined || ox_socket !== old) {
-            return;
-        }
-        const {dat, forceStr} = pendingRestart;
+    if (old !== undefined) {
+        old.shutdown();
+    }
+    afterClosed(old, () => {
+        const restart = pendingRestart;
         pendingRestart = undefined;
-        connect(dat, forceStr);
-    };
-    if (old.readyState === WebSocket.CLOSED) {
-        go();
+        if (restart !== undefined && simulationOn) {
+            connect(restart.dat, restart.forceStr);
+        }
+    });
+}
+
+// Call `then` once `socket` (being shut down, or undefined) has closed, or
+// after RESTART_CLOSE_WAIT at most, so that oxServe never counts the old and
+// the new connection against its connection limit at the same time
+function afterClosed(socket, then) {
+    if (socket === undefined || socket.readyState === WebSocket.CLOSED) {
+        then();
         return;
     }
-    old.addEventListener("close", go, {once: true});
-    setTimeout(go, RESTART_CLOSE_WAIT);
-    old.shutdown();
+    let done = false;
+    const once = () => {
+        if (!done) {
+            done = true;
+            then();
+        }
+    };
+    socket.addEventListener("close", once, {once: true});
+    setTimeout(once, RESTART_CLOSE_WAIT);
+}
+
+// Connect, once the last stopped connection has closed, from the latest
+// configuration with the current pulls (if still on and not connected)
+function connectWhenFree() {
+    afterClosed(closingSocket, () => {
+        if (simulationOn && ox_socket === undefined && system !== undefined) {
+            connect(latestDat(), forceString());
+        }
+    });
 }
 
 function onSelectEnd(event) {
@@ -420,6 +471,7 @@ function setMoveMode(on) {
     movePanel.setStiffness(pullStiffness);
     movePanel.setLabel("toggleBox", boxVisible ? "Hide box" : "Show box");
     updateDesignMenu();
+    updateSimulationButton();
     updateConnectionStatus(performance.now());
 }
 
@@ -463,6 +515,10 @@ function stopInteractions() {
 // place to attach it to) in the room in front of the viewer
 function placeMenu() {
     menuNeedsPlacement = false;
+    // A tip that was ready before must come out in front of the new place
+    for (const c of [controller1, controller2]) {
+        c.userData.poke.armed = false;
+    }
     const left = leftController();
     if (isHand(left)) {
         const xrCamera = renderer.xr.getCamera();
@@ -487,12 +543,18 @@ function onSessionVisibilityChange(event) {
         return;
     }
     if (sessionBlurred && isHand(leftController()) && !moveMode) {
+        // Counts as a toggle, so a brief menu button report right after
+        // does not close it again
+        lastMenuToggle = performance.now();
         setMoveMode(true);
     }
     sessionBlurred = false;
 }
 
 function menuAction(button) {
+    if (button === undefined) {
+        return;
+    }
     switch (button) {
     case "resetPosition":
         if (renderer.xr.isPresenting) {
@@ -512,7 +574,7 @@ function menuAction(button) {
         if (system !== undefined) {
             releaseAllPulls(false);
             updateStrandsFromDat(initialDat, system);
-            restartSimulation(initialDat, "");
+            continueFrom(initialDat, "");
         }
         break;
     case "toggleBox":
@@ -544,12 +606,19 @@ function menuAction(button) {
     case "designLoad":
         loadDesign(selectedDesign);
         break;
+    case "simulation":
+        if (simulationOn) {
+            stopSimulation();
+        } else {
+            startSimulation();
+        }
+        break;
     case "reconnect":
         // A fresh connection, continuing from the latest configuration
         // with the current pulls
-        if (ox_socket !== undefined) {
+        if (simulationOn && ox_socket !== undefined) {
             reconnectTimes.length = 0;
-            restartSimulation(ox_socket.get_latest_dat(), ox_socket.forces);
+            continueFrom(ox_socket.get_latest_dat(), ox_socket.forces);
         }
         break;
     case "exitXR": {
@@ -643,7 +712,13 @@ function pollMenuButton() {
             }
         }
     }
-    if (pressed && !controller.userData.menuPressed) {
+    // Toggle on press (a hand's emulated menu button may only be pressed
+    // for a moment, so no hold is required); the cooldown stops a double
+    // toggle
+    const now = performance.now();
+    if (pressed && !controller.userData.menuPressed &&
+        now - lastMenuToggle >= MENU_TOGGLE_COOLDOWN) {
+        lastMenuToggle = now;
         setMoveMode(!moveMode);
     }
     controller.userData.menuPressed = pressed;
@@ -662,15 +737,17 @@ function updatePanelHover() {
         }
         const tip = pokeTip(c);
         if (tip === undefined) {
-            // Untracked: no highlight. A press stays down until the tip is
-            // seen away from the panel, so it cannot click twice.
+            // Untracked (or a controller): no highlight. An ongoing press
+            // only re-arms once the tip is seen out in front again.
             c.userData.poke.hovered = undefined;
         }
         const poked = tip === undefined ? undefined : movePanel.poke(tip, c.userData.poke);
         if (c.userData.poke.hovered !== undefined) {
             hovered = c.userData.poke.hovered;
         }
-        if (poked !== undefined) {
+        const now = performance.now();
+        if (poked !== undefined && now - (c.userData.poke.lastAt ?? -Infinity) >= POKE_COOLDOWN) {
+            c.userData.poke.lastAt = now;
             menuAction(poked);
             if (!moveMode) {
                 return;
@@ -732,6 +809,12 @@ let ox_socket;
 // The starting configuration, for resetting the structure, and what is
 // needed to reconnect to oxServe
 let initialDat, initialTop, simulationType;
+// Whether the oxServe simulation is on. It is off on every page load (no
+// connection); the menu starts and stops it.
+let simulationOn = false;
+// The configuration the simulation continues from when it is started
+// again (the last frame when it was stopped, or a reset or dropped one)
+let stoppedDat;
 let anchorStatus = "none";
 // After this long (ms) without a frame, a running simulation is reported
 // as stalled
@@ -744,6 +827,10 @@ const RECONNECT_DELAY = 2000;
 // A restart waiting for the old connection to close, and how long (ms) it
 // waits at most
 let pendingRestart;
+// The connection last stopped, while it closes (a start waits for it)
+let closingSocket;
+// The page's start/stop button (outside XR)
+let simulationButton;
 const RESTART_CLOSE_WAIT = 1000;
 
 const targetScale = new THREE.Vector3(1/100, 1/100, 1/100);
@@ -823,7 +910,7 @@ const initSceneFromJSON = (txt) => {
     newSystem.createViewMesh();
 
     // Drop everything that belongs to the previous system. Its connection
-    // is closed by restartSimulation below.
+    // (if the simulation is on) is replaced by continueFrom below.
     if (system !== undefined) {
         system.dispose();
     }
@@ -874,12 +961,16 @@ const initSceneFromJSON = (txt) => {
     // TODO: Check more than just one monomer
     simulationType = system.strands[0].monomers[0].getCategory();
     reconnectTimes.length = 0;
-    if (ox_socket === undefined) {
-        connect(dat_file, "");
-    } else {
-        // Replaces any restart still pending for the previous system
-        pendingRestart = undefined;
-        restartSimulation(dat_file, "");
+    stoppedDat = undefined;
+    // Simulate the new structure if the simulation is on
+    if (simulationOn) {
+        if (ox_socket === undefined) {
+            connectWhenFree();
+        } else {
+            // Replaces any restart still pending for the previous system
+            pendingRestart = undefined;
+            continueFrom(dat_file, "");
+        }
     }
 
     return [strands, n_monomers];
@@ -929,8 +1020,79 @@ function reconnect() {
 }
 
 function connectionLost() {
-    return ox_socket.readyState === WebSocket.CLOSING ||
-        ox_socket.readyState === WebSocket.CLOSED;
+    return ox_socket !== undefined && (
+        ox_socket.readyState === WebSocket.CLOSING ||
+        ox_socket.readyState === WebSocket.CLOSED
+    );
+}
+
+// Connect to oxServe and simulate, from the latest configuration and with
+// the current pulls
+function startSimulation() {
+    if (simulationOn) {
+        return;
+    }
+    simulationOn = true;
+    reconnectTimes.length = 0;
+    updateSimulationButton();
+    // Before the first structure has loaded, initSceneFromJSON connects
+    connectWhenFree();
+}
+
+// Stop simulating and disconnect, keeping the last configuration (and the
+// pulls) for the next start
+function stopSimulation() {
+    if (!simulationOn) {
+        return;
+    }
+    simulationOn = false;
+    if (pendingRestart !== undefined) {
+        // A restart was about to start from this (e.g. a reset or a newly
+        // loaded structure)
+        stoppedDat = pendingRestart.dat;
+        pendingRestart = undefined;
+    } else if (ox_socket !== undefined) {
+        stoppedDat = ox_socket.get_latest_dat();
+    }
+    if (ox_socket !== undefined) {
+        closingSocket = ox_socket;
+        ox_socket.shutdown();
+        ox_socket = undefined;
+    }
+    // Show where the next start continues from
+    if (stoppedDat !== undefined && system !== undefined) {
+        updateStrandsFromDat(stoppedDat, system);
+    }
+    updateSimulationButton();
+}
+
+function updateSimulationButton() {
+    if (movePanel !== undefined) {
+        movePanel.setLabel("simulation",
+            simulationOn ? "Stop simulation" : "Start simulation");
+    }
+    if (simulationButton !== undefined) {
+        simulationButton.textContent =
+            simulationOn ? "STOP SIMULATION" : "START SIMULATION";
+    }
+}
+
+// The same switch on the page, for viewing without a headset
+function makeSimulationButton() {
+    const button = document.createElement("button");
+    button.style.cssText = "position: absolute; bottom: 20px; left: 20px; " +
+        "padding: 12px 10px; border: 1px solid #fff; border-radius: 4px; " +
+        "background: rgba(0, 0, 0, 0.1); color: #fff; " +
+        "font: normal 13px sans-serif; cursor: pointer; z-index: 999;";
+    button.addEventListener("click", () => {
+        if (simulationOn) {
+            stopSimulation();
+        } else {
+            startSimulation();
+        }
+    });
+    document.body.appendChild(button);
+    return button;
 }
 
 // Show the live state of the oxServe connection in the menu
@@ -939,8 +1101,10 @@ function updateConnectionStatus(now) {
         return;
     }
     movePanel.setInfo(`Room anchor: ${anchorStatus}`);
-    if (ox_socket === undefined) {
-        movePanel.setConnection("Not connected", "#8f9aab");
+    if (!simulationOn) {
+        movePanel.setConnection("Simulation off", "#8f9aab");
+    } else if (ox_socket === undefined) {
+        movePanel.setConnection("Connecting\u2026", "#f5c542");
     } else if (ox_socket.readyState === WebSocket.CONNECTING) {
         movePanel.setConnection("Connecting\u2026", "#f5c542");
     } else if (ox_socket.readyState !== WebSocket.OPEN) {
@@ -965,10 +1129,9 @@ const init = () => {
         // -> simple parser test
         files[0].text().then(text => {
             updateStrandsFromDat(text, system);
-            // Continue the simulation from the dropped configuration
-            if (ox_socket !== undefined) {
-                restartSimulation(text, ox_socket.forces);
-            }
+            // Continue (or later start) the simulation from the dropped
+            // configuration
+            continueFrom(text, forceString());
         });
     });
 
@@ -1083,6 +1246,8 @@ const init = () => {
     document.body.appendChild(XRButton.createButton(renderer, {
         optionalFeatures: ["light-estimation", "anchors", "hand-tracking"]
     }));
+    simulationButton = makeSimulationButton();
+    updateSimulationButton();
 
     // Don't add the XREstimatedLight to the scene initially.
     // It doesn't have any estimated lighting values until an AR session starts.
@@ -1161,7 +1326,7 @@ const init = () => {
         c.addEventListener("selectstart", onSelectStart);
         c.addEventListener("selectend", onSelectEnd);
         // Per controller state of poking the menu
-        c.userData.poke = {down: false, hovered: undefined};
+        c.userData.poke = {armed: false, hovered: undefined};
 
         // Keep the input source, for haptic feedback
         c.addEventListener("connected", e => {
@@ -1222,7 +1387,9 @@ const init = () => {
             get system() { return system; },
             get socket() { return ox_socket; },
             get group() { return group; },
-            forces, startPull, sendForces, releasePull
+            get moveMode() { return moveMode; },
+            controllers: [controller1, controller2],
+            forces, startPull, sendForces, releasePull, pollMenuButton, menuAction
         };
     }
 };

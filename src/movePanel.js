@@ -1,11 +1,11 @@
 import * as THREE from "three";
 
-// The in-scene menu: a small floating window drawn on a canvas. Its buttons
-// are clicked by pointing a controller ray (or a hand's pinch ray) at them
-// and selecting, or by poking them with a finger tip or controller.
+// The in-scene menu: a small floating window drawn on a canvas. Controllers
+// click its buttons by pointing their ray at them and pulling the trigger;
+// hands poke them with the index finger tip.
 
 const WIDTH = 512;
-const HEIGHT = 700;
+const HEIGHT = 740;
 // Size in metres
 const PANEL_WIDTH = 0.22;
 const PANEL_HEIGHT = PANEL_WIDTH * HEIGHT / WIDTH;
@@ -20,15 +20,22 @@ const BUTTONS = {
     designNext: {label: "\u25B6", x: 418, y: 300, w: 70, h: 70},
     designLoad: {label: "Load structure", x: 24, y: 390, w: 226, h: 70},
     toggleBox: {label: "Hide box", x: 262, y: 390, w: 226, h: 70},
+    simulation: {label: "Start simulation", x: 24, y: 480, w: 226, h: 70},
     reconnect: {label: "Reconnect", x: 262, y: 480, w: 226, h: 70},
     done: {label: "Done", x: 24, y: 570, w: 226, h: 70},
     exitXR: {label: "Exit XR", x: 262, y: 570, w: 226, h: 70}
 };
 
-// A poke counts when the tip is within this distance (metres) in front of
-// or behind the panel, and is released once it is further than RELEASE
-const POKE_DEPTH = 0.012;
-const POKE_RELEASE = 0.03;
+// A poke is a press from the front (the side facing the viewer): the tip
+// arms once it is over the panel at least POKE_ARM (metres) in front of it,
+// and clicks when it then reaches POKE_PRESS from the surface (or crosses
+// it within one frame) over a button. Leaving the panel's outline disarms
+// it, and after a click it only arms again out in front, so jitter, sliding
+// across buttons, coming in from the side or from behind never click.
+const POKE_ARM = 0.015;
+const POKE_PRESS = 0.003;
+// Within this distance in front, the button under the tip is highlighted
+const POKE_HOVER = 0.05;
 
 const _raycaster = new THREE.Raycaster();
 const _hits = [];
@@ -79,7 +86,7 @@ export class MovePanel {
     // Float above a controller, tilted towards the user
     attachTo(controller) {
         controller.add(this.mesh);
-        this.mesh.position.set(0, 0.18, -0.08);
+        this.mesh.position.set(0, 0.2, -0.08);
         this.mesh.rotation.set(-0.5, 0, 0);
     }
 
@@ -134,25 +141,26 @@ export class MovePanel {
             ctx.roundRect(b.x, b.y, b.w, b.h, 16);
             ctx.fill();
             ctx.fillStyle = "#ffffff";
-            ctx.font = b.w > 100 ? "bold 28px sans-serif" : "bold 40px sans-serif";
-            ctx.fillText(this.labels[name] ?? b.label, b.x + b.w / 2, b.y + b.h / 2);
+            const label = this.labels[name] ?? b.label;
+            ctx.font = b.w <= 100 ? "bold 40px sans-serif" :
+                label.length >= 15 ? "bold 25px sans-serif" : "bold 28px sans-serif";
+            ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2);
         }
         ctx.fillStyle = "#8f9aab";
         ctx.font = "19px sans-serif";
-        ctx.fillText(this.info, WIDTH / 2, 672);
+        ctx.fillText(this.info, WIDTH / 2, 712);
 
-        // Connection state: a coloured dot and a word, next to Reconnect
+        // Simulation state: a coloured dot and a few words
+        ctx.font = "bold 24px sans-serif";
+        const textWidth = ctx.measureText(this.connection).width;
+        const left = (WIDTH - textWidth - 34) / 2;
         ctx.fillStyle = this.connectionColor;
         ctx.beginPath();
-        ctx.arc(48, 515, 13, 0, 2 * Math.PI);
+        ctx.arc(left + 12, 668, 12, 0, 2 * Math.PI);
         ctx.fill();
         ctx.textAlign = "left";
         ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 24px sans-serif";
-        ctx.fillText(this.connection, 72, 503);
-        ctx.font = "19px sans-serif";
-        ctx.fillStyle = "#8f9aab";
-        ctx.fillText("oxServe", 72, 531);
+        ctx.fillText(this.connection, left + 34, 669);
         this.texture.needsUpdate = true;
     }
 
@@ -231,28 +239,37 @@ export class MovePanel {
     }
 
     // Poke the panel with a tip (world position). `state` is an object kept
-    // per tip. Returns the name of a button when it is newly poked.
+    // per tip ({armed, hovered}). Returns the name of a button when it is
+    // pressed.
     poke(tip, state) {
+        state.hovered = undefined;
         if (!this.mesh.visible) {
-            state.down = false;
+            state.armed = false;
             return undefined;
         }
         this.mesh.worldToLocal(_local.copy(tip));
+        const z = _local.z;
         const inside =
             Math.abs(_local.x) <= PANEL_WIDTH / 2 &&
             Math.abs(_local.y) <= PANEL_HEIGHT / 2;
-        if (!inside || Math.abs(_local.z) > POKE_RELEASE) {
-            state.down = false;
-            state.hovered = undefined;
+        if (!inside) {
+            state.armed = false;
             return undefined;
+        }
+        // Over the panel, out in front: ready for the next press
+        if (z >= POKE_ARM) {
+            state.armed = true;
         }
         const button = buttonAt(
             (_local.x / PANEL_WIDTH + 0.5) * WIDTH,
             (0.5 - _local.y / PANEL_HEIGHT) * HEIGHT
         );
-        state.hovered = button;
-        if (Math.abs(_local.z) <= POKE_DEPTH && !state.down) {
-            state.down = true;
+        if (z >= 0 && z <= POKE_HOVER) {
+            state.hovered = button;
+        }
+        if (state.armed && z <= POKE_PRESS) {
+            // Pressed in: no more clicks until the tip is back out in front
+            state.armed = false;
             return button;
         }
         return undefined;

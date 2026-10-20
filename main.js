@@ -33,7 +33,7 @@ function onSelectStart(event) {
         if (forces.has(controller)) {
             const f = forces.get(controller);
             scene.remove(f.coneMesh);
-            forces.remove(controller);
+            forces.delete(controller);
         }
     }
 
@@ -101,28 +101,8 @@ function onSelectStart(event) {
 }
 
 function onSelectEnd(event) {
-
     const controller = event.target;
-
-    if (controller.userData.selected !== undefined) {
-
-        const object = controller.userData.selected;
-        const id = controller.userData.selectedId;
-
-        const m = new THREE.Matrix4();
-        const p = new THREE.Vector3();
-        const q = new THREE.Quaternion();
-        const s = new THREE.Vector3();
-        object.getMatrixAt(id, m);
-        m.decompose(p, q, s);
-        s.divideScalar(1.2);
-        m.compose(p, q, s);
-        object.setMatrixAt(id, m);
-        object.instanceMatrix.needsUpdate = true;
-
-        controller.userData.selected = undefined;
-    }
-
+    controller.userData.selected = undefined;
 }
 
 let container;
@@ -250,9 +230,8 @@ const initSceneFromJSON = (txt) => {
     console.log(ox_socket);
     window.socket = ox_socket;
 
-    new Promise(resolve => setTimeout(resolve, 2000)).then(() => {
-        ox_socket.start_simulation();
-    });
+    // Waits for the connection to open if needed
+    ox_socket.start_simulation();
 
     return [strands, n_monomers];
 };
@@ -305,11 +284,11 @@ const init = () => {
             this.counter = 0;
 
             this.designs = [
+                "monohole_1b.oxview",
                 //"6-bar.oxview",
                 //"hairygami.oxview",
                 //"hairpin.oxview",
                 //"Leaf.oxview",
-                "monohole_1b.oxview",
                 //"moon.oxview",
                 //"meta.oxview",
                 //"gated-channel.oxview",
@@ -317,8 +296,11 @@ const init = () => {
                 //"teather.oxview",
                 //"planeV3.oxview",
                 //"1eua.oxview",
-                "rna_crossover.oxview"
-            ].map(p => "resources/" + p);
+                //"rna_crossover.oxview"
+            ].map(p => import.meta.env.BASE_URL + "resources/" + p);
+        }
+        getCurrent() {
+            return this.designs[this.counter];
         }
         getNext() {
             this.counter += 1;
@@ -340,7 +322,7 @@ const init = () => {
     let designStorage = new DesignStorage();
 
     //load up first design
-    fetch(designStorage.getRand()).then(
+    fetch(designStorage.getCurrent()).then(
         resp => resp.text()
     ).then(initSceneFromJSON);
 
@@ -576,11 +558,12 @@ function render() {
             lerpFrac = 1;
         }
 
-        for (let i=0; i<system.idCounter; i++) {
+        // idCounter is the highest id in use, so it is included
+        for (let i=0; i<=system.idCounter; i++) {
             if (!system.elements.has(i)) {
                 // Hide instance if element doesn't exist
                 system.instancedMesh.setMatrixAt(
-                    i, new THREE.Matrix4()
+                    i, new THREE.Matrix4().makeScale(0, 0, 0)
                 );
                 continue;
             }
@@ -614,6 +597,9 @@ function render() {
             system.instancedMesh.setMatrixAt(i, dummy.matrix);
         }
         system.instancedMesh.instanceMatrix.needsUpdate = true;
+        // The raycaster culls against a cached bounding sphere, so keep it
+        // in sync with the moving instances
+        system.instancedMesh.computeBoundingSphere();
     }
 
     renderer.setAnimationLoop(render);

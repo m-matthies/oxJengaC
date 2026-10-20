@@ -1,11 +1,14 @@
 # oxJenga
 Interactive augmented reality simulation of DNA nanostructures. Forked from https://github.com/zoombya/oxJenga/ by Dr. Michael Matthies.
 
-Try it out now at https://akodiat.github.io/oxJenga. If you have an AR/VR headset, open this URL in the internal web browser and click "START XR".
+Try it out now at https://m-matthies.github.io/oxJengaC/. If you have an AR/VR headset, open this URL in the internal web browser and click "START XR".
 
 ## Running locally
-If you have python 3, you can type:
-`python -m http.server 8000`
-
-A full list of oneliners is available here:
-https://github.com/imgarylai/awesome-webservers
+The app is built with [Vite](https://vitejs.dev/):
+```
+npm install
+npm run dev      # dev server, also exposed on the local network
+npm run build    # production build in dist/
+npm run preview  # serve the production build
+npm run deploy   # build and publish to GitHub Pages (gh-pages branch)
+```

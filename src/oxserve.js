@@ -51,14 +51,34 @@ export class OXServeSocket extends WebSocket{
     }
 
     stop_simulation() {
-        this.send("abort");
+        if (this.readyState === WebSocket.OPEN) {
+            this.send("abort");
+        }
         this.abort = true;
     }
 
     start_simulation() {
+        if (this.readyState === WebSocket.CONNECTING) {
+            // Defer until connected, sending throws before that
+            if (!this.startPending) {
+                this.startPending = true;
+                this.addEventListener("open", () => {
+                    this.startPending = false;
+                    this.start_simulation();
+                }, {once: true});
+            }
+            return;
+        }
+        if (this.readyState !== WebSocket.OPEN) {
+            console.warn("Cannot start simulation, oxServe connection is closed");
+            return;
+        }
         this.abort = false;
         let conf = {};
         conf["settings"] = this.relax_scenario;
+        if (this.forces !== undefined) {
+            conf["trap_file"] = this.forces;
+        }
         conf["top_file"] = this.top;
         conf["dat_file"] = this.dat;
         this.send(
@@ -72,15 +92,11 @@ export class OXServeSocket extends WebSocket{
             return;
         }
         this.forces = forces;
-        this.send("abort");
-        let conf = {};
-        conf["settings"] = this.relax_scenario;
-        conf["trap_file"] = forces;
-        conf["top_file"] = this.top;
-        conf["dat_file"] = this.dat;
-        this.send(
-            JSON.stringify(conf)
-        );
+        if (this.readyState === WebSocket.OPEN) {
+            this.send("abort");
+        }
+        // Restart from the latest configuration with the new forces
+        this.start_simulation();
     }
 }
  

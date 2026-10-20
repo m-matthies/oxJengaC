@@ -26,7 +26,7 @@ class System {
         const centreOfMass = this.getCenterOfMass();
 
         for (const m of this.elements.values()) {
-            m.position.add(centreOfMass).add(origin);
+            m.position.sub(centreOfMass).add(origin);
         }
     }
 

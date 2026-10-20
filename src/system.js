@@ -215,6 +215,28 @@ class System {
         return v.fromArray(this.instancedMesh.instanceMatrix.array, 16 * index + 12);
     }
 
+    // Latest simulated backbone position of an element
+    getTargetPosition(index, v = new THREE.Vector3()) {
+        return v.fromArray(this.targets, 3 * index);
+    }
+
+    // Indices of all elements whose latest simulated backbone position lies
+    // within `radius` of `center` (both in oxDNA coordinates)
+    getIndicesWithin(center, radius) {
+        const t = this.targets;
+        const r2 = radius * radius;
+        const indices = [];
+        for (let i = 0, j = 0, n = t.length / 3; i < n; i++, j += 3) {
+            const dx = t[j] - center.x;
+            const dy = t[j + 1] - center.y;
+            const dz = t[j + 2] - center.z;
+            if (dx * dx + dy * dy + dz * dz <= r2) {
+                indices.push(i);
+            }
+        }
+        return indices;
+    }
+
     // Find the closest bead hit by a world-space ray. This is an analytical
     // ray-sphere test against the bead centres, much cheaper than the
     // per-instance triangle raycast of THREE.InstancedMesh. Returns the hit

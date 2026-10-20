@@ -8,10 +8,12 @@ const strandColors = [
     new THREE.Color(0x6ea4cc), //light blue
 ];
 
-const monomerGeometry = new THREE.SphereGeometry(0.75, 6, 6);
+const monomerGeometry = new THREE.SphereGeometry(0.75, 8, 6);
+// Matte and non-metallic, so the colours come from diffuse light with only
+// faint highlights
 const monomerMaterial = new THREE.MeshStandardMaterial({
-    roughness: 0.7,
-    metalness: 0.5
+    roughness: 0.85,
+    metalness: 0.0
 });
 
 export {strandColors, monomerGeometry, monomerMaterial};

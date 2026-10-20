@@ -10,88 +10,134 @@ import {
 } from "./src/file.js";
 
 import { XREstimatedLight } from "three/addons/webxr/XREstimatedLight.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { establishConnection } from "./src/oxserve.js";
 
 import { drawBox, drawCone, positionCone } from "./src/utils.js";
+import { MovePanel } from "./src/movePanel.js";
+import { RoomAnchor } from "./src/roomAnchor.js";
 
 import {
     DNAMonomer, RNAMonomer, AminoAcidMonomer,
     Strand, System
 } from "./src/system.js";
 
+// Pulls act on every bead within this radius of the picked one, in oxDNA
+// length units (1 unit = 0.8518 nm). About the radius of a six-helix bundle.
+const PULL_RADIUS = 5.2;
+// Total trap stiffness of one pull, shared evenly by all of its beads
+const PULL_STIFFNESS = 0.15;
+
+// Gamepad buttons of the left controller that open the move window: X and
+// Y, plus anything after the thumbrest (where some runtimes report the
+// menu button)
+const isMenuButton = (i) => i === 4 || i === 5 || i >= 7;
+
 // Reused scratch objects for controller picking and cone updates
 const _ray = new THREE.Ray();
 const _hit = {};
 const _rotation = new THREE.Matrix4();
 const _beadPos = new THREE.Vector3();
+const _grabMatrix = new THREE.Matrix4();
+const _grabScale = new THREE.Vector3();
+const _trapPos = new THREE.Vector3();
 
-// Find the bead the controller is pointing at
-function pickFromController(controller) {
+// Direction of the key light from the structure
+const KEY_LIGHT_OFFSET = new THREE.Vector3(1, 3, 2);
+
+// The world space ray a controller points along
+function controllerRay(controller) {
     _rotation.identity().extractRotation(controller.matrixWorld);
     _ray.origin.setFromMatrixPosition(controller.matrixWorld);
     _ray.direction.set(0, 0, -1).applyMatrix4(_rotation);
-    return system.pick(_ray, _hit);
+    return _ray;
+}
+
+// Find the bead the controller is pointing at
+function pickFromController(controller) {
+    return system.pick(controllerRay(controller), _hit);
+}
+
+// One oxDNA trap force block
+function trapBlock(particle, pos0, stiff) {
+    return `
+        {
+        type = trap
+        particle = ${particle}
+        pos0 = ${pos0.toArray().map(v => v.toFixed(3)).join(", ")}
+        stiff = ${stiff}
+        rate = 0.
+        dir = 1.,0.,0.
+        }
+         `;
 }
 
 function onSelectStart(event) {
+    const controller = event.target;
+
+    if (moveMode) {
+        onMoveSelectStart(controller);
+        return;
+    }
 
     // Do not select things if there is no system
     if (system === undefined) {
         return;
     }
 
-    const controller = event.target;
     const hit = pickFromController(controller);
-
     if (hit === undefined) {
         // Pointing at nothing releases this controller's pull
         if (forces.has(controller)) {
             controller.userData.cone.visible = false;
+            controller.userData.sphere.visible = false;
             forces.delete(controller);
+            sendForces();
         }
-    } else {
-        controller.userData.selected = hit.index;
-
-        console.log("Selected particle " + hit.index);
-
-        // Get controller position
-        const target = controller.position.clone();
-
-        // Show the "tractor beam" cone
-        const cone = controller.userData.cone;
-        cone.visible = true;
-        positionCone(cone, target, hit.point);
-
-        // Convert to oxDNA coordinates
-        let oxDNATarget = system.instancedMesh.worldToLocal(target.clone());
-
-        console.log(`Pull particle ${hit.index} toward ${oxDNATarget.toArray()}`);
-
-        forces.set(controller, {
-            target: target,
-            oxDNATarget: oxDNATarget,
-            nucId: hit.index
-        });
+        return;
     }
+
+    controller.userData.selected = hit.index;
+
+    // Pull toward where the controller is now. The pull stays until the
+    // controller selects empty space (or another region).
+    const target = controller.position.clone();
+
+    // Pull every bead within PULL_RADIUS of the picked one. Each keeps its
+    // offset from the picked bead, so the region is moved as a whole
+    // instead of one bead being torn out.
+    const center = system.getTargetPosition(hit.index);
+    const particles = system.getIndicesWithin(center, PULL_RADIUS);
+    const offsets = new Float32Array(3 * particles.length);
+    particles.forEach((i, k) => {
+        system.getTargetPosition(i, _trapPos).sub(center).toArray(offsets, 3 * k);
+    });
+    forces.set(controller, {
+        nucId: hit.index,
+        particles: particles,
+        offsets: offsets,
+        stiff: PULL_STIFFNESS / particles.length,
+        // The target in world and in oxDNA coordinates
+        target: target,
+        oxDNATarget: system.instancedMesh.worldToLocal(target.clone())
+    });
+
+    console.log(`Pull ${particles.length} particles around ${hit.index}`);
+
+    // Show the "tractor beam" cone
+    controller.userData.cone.visible = true;
+    updateCones();
 
     sendForces();
 }
 
 // Send the current pulls to oxDNA as trap forces
 function sendForces() {
-    let forceStr = [...forces.values()].map(f =>
-        `
-        {
-        type = trap
-        particle = ${f.nucId}
-        pos0 = ${f.oxDNATarget.toArray().map(v => v.toFixed(3)).join(", ")}
-        stiff = 0.1
-        rate = 0.
-        dir = 1.,0.,0.
-        }
-         `
-    ).join("\n");
-    console.log(forceStr);
+    const forceStr = [...forces.values()].map(f => f.particles.map(
+        (i, k) => trapBlock(
+            i, _trapPos.fromArray(f.offsets, 3 * k).add(f.oxDNATarget), f.stiff
+        )
+    ).join("\n")).join("\n");
 
     // Send new forces to oxDNA
     ox_socket.update_forces(forceStr);
@@ -100,6 +146,100 @@ function sendForces() {
 function onSelectEnd(event) {
     const controller = event.target;
     controller.userData.selected = undefined;
+    if (grab !== undefined && grab.controller === controller) {
+        // Place the structure where it is, and keep it there
+        grab = undefined;
+        roomAnchor.requestPlacement();
+        movePanel.setStatus("");
+    }
+}
+
+// The controller held in the left hand (falls back to the first one if
+// the runtime does not report handedness)
+function leftController() {
+    for (const c of [controller1, controller2]) {
+        const source = c.userData.inputSource;
+        if (source && source.handedness === "left") {
+            return c;
+        }
+    }
+    return controller1;
+}
+
+// Open or close the move window. While it is open, the trigger grabs the
+// whole structure instead of pulling beads.
+function setMoveMode(on) {
+    moveMode = on;
+    grab = undefined;
+    if (on) {
+        // Pull targets are fixed in the room, so let go before moving
+        releaseAllPulls();
+        leftController().add(movePanel.mesh);
+    }
+    movePanel.mesh.visible = on;
+    movePanel.setHovered(undefined);
+    movePanel.setStatus("");
+}
+
+function onMoveSelectStart(controller) {
+    const panelHit = movePanel.hitTest(controllerRay(controller));
+    if (panelHit !== undefined) {
+        if (panelHit.button === "reset") {
+            group.position.set(0, 0, 0);
+            group.quaternion.identity();
+            roomAnchor.requestPlacement();
+        } else if (panelHit.button === "done") {
+            setMoveMode(false);
+        }
+        return;
+    }
+    // Grab: keep the structure's pose relative to the controller
+    group.updateMatrix();
+    grab = {
+        controller: controller,
+        offset: controller.matrix.clone().invert().multiply(group.matrix)
+    };
+    pulse(controller);
+    movePanel.setStatus("Release the trigger to place");
+}
+
+// Carry the grabbed structure along with the controller
+function updateGrab() {
+    _grabMatrix.multiplyMatrices(grab.controller.matrix, grab.offset);
+    // The scale is left to the zoom-in lerp in render()
+    _grabMatrix.decompose(group.position, group.quaternion, _grabScale);
+}
+
+// Open the move window on a press of the left controller's menu button
+function pollMenuButton() {
+    const controller = leftController();
+    const source = controller.userData.inputSource;
+    let pressed = false;
+    if (source && source.gamepad) {
+        const buttons = source.gamepad.buttons;
+        for (let i = 0; i < buttons.length; i++) {
+            if (isMenuButton(i) && buttons[i].pressed) {
+                pressed = true;
+            }
+        }
+    }
+    if (pressed && !controller.userData.menuPressed) {
+        setMoveMode(!moveMode);
+    }
+    controller.userData.menuPressed = pressed;
+}
+
+// Point the controller rays at the move window and highlight its buttons
+function updatePanelHover() {
+    let hovered;
+    for (const c of [controller1, controller2]) {
+        const hit = movePanel.hitTest(controllerRay(c));
+        c.userData.line.scale.z = hit === undefined ? 5 : hit.distance;
+        if (hit !== undefined && hit.button !== undefined) {
+            hovered = hit.button;
+        }
+    }
+    movePanel.setHovered(hovered);
 }
 
 // Let go of everything, e.g. when the XR session ends (no selectend fires
@@ -107,8 +247,11 @@ function onSelectEnd(event) {
 function releaseAllPulls() {
     for (const c of [controller1, controller2]) {
         c.userData.cone.visible = false;
+        c.userData.sphere.visible = false;
         c.userData.selected = undefined;
-        setHighlight(c, undefined);
+        if (system !== undefined) {
+            setHighlight(c, undefined);
+        }
     }
     if (forces.size > 0) {
         forces.clear();
@@ -123,14 +266,23 @@ let controllerGrip1, controllerGrip2;
 
 const forces = new Map();
 
+// Move window state: whether it is open, and the controller holding the
+// structure with the structure's pose relative to it
+let moveMode = false;
+let movePanel;
+let grab;
+// Keeps the structure fixed in the room
+let roomAnchor;
+
 let controls, group;
+let keyLight, roomEnvironment;
 
 // my oxDNA related mess
 let box;
 let system;
 let ox_socket;
 
-const targetScale = new THREE.Vector3(1/50, 1/50, 1/50);
+const targetScale = new THREE.Vector3(1/100, 1/100, 1/100);
 
 const controllerColors = {
     left: new THREE.Color(0x188DFF),
@@ -206,6 +358,7 @@ const initSceneFromJSON = (txt) => {
     }
     for (const c of [controller1, controller2]) {
         c.userData.cone.visible = false;
+        c.userData.sphere.visible = false;
         // Highlights belonged to the old system's colours
         c.userData.highlighted = undefined;
         c.userData.selected = undefined;
@@ -283,22 +436,38 @@ const init = () => {
     controls = new OrbitControls(camera, container);
     controls.update();
 
-    let hemilight = new THREE.HemisphereLight(0x808080, 0x606060);
-    hemilight.intensity = 5;
+    // Soft sky/ground ambient, a warm shadow casting key light, a cool fill
+    // light from the other side and a rim light from behind. Image based
+    // lighting from a room environment (set up with the renderer) adds
+    // reflections and soft shading.
+    const hemilight = new THREE.HemisphereLight(0xdfe8ff, 0x3a3a48, 1.2);
 
-    const light = new THREE.DirectionalLight(0xffffff);
-    light.position.set(0, 6, 0);
-    light.intensity = 6;
-    light.castShadow = true;
-    light.shadow.camera.top = 2;
-    light.shadow.camera.bottom = -2;
-    light.shadow.camera.right = 2;
-    light.shadow.camera.left = -2;
-    light.shadow.mapSize.set(2048, 2048);
+    // The key light follows the structure (see render()), so that its
+    // shadow camera covers it wherever it is placed
+    keyLight = new THREE.DirectionalLight(0xfff2e0, 2.5);
+    keyLight.castShadow = true;
+    keyLight.shadow.camera.top = 1;
+    keyLight.shadow.camera.bottom = -1;
+    keyLight.shadow.camera.right = 1;
+    keyLight.shadow.camera.left = -1;
+    keyLight.shadow.camera.near = 1;
+    keyLight.shadow.camera.far = 7;
+    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.bias = -0.0002;
+    keyLight.shadow.normalBias = 0.002;
+    keyLight.shadow.radius = 3;
+    scene.add(keyLight.target);
+
+    const fillLight = new THREE.DirectionalLight(0xd8e4ff, 0.8);
+    fillLight.position.set(-3, 1, 2);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    rimLight.position.set(0, 2, -4);
 
     let defaultLight = new THREE.Group();
     defaultLight.add(hemilight);
-    defaultLight.add(light);
+    defaultLight.add(keyLight);
+    defaultLight.add(fillLight);
+    defaultLight.add(rimLight);
     scene.add(defaultLight);
 
     class DesignStorage {
@@ -306,7 +475,8 @@ const init = () => {
             this.counter = 0;
 
             this.designs = [
-                "flippy.oxview",
+                "flippy_turned.oxview",
+                //"flippy.oxview",
                 //"monohole_1b.oxview",
                 //"6-bar.oxview",
                 //"hairygami.oxview",
@@ -362,25 +532,38 @@ const init = () => {
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.shadowMap.enabled = true;
+    // Keeps the strand colours' hues while compressing highlights
+    renderer.toneMapping = THREE.NeutralToneMapping;
     renderer.xr.enabled = true;
     renderer.xr.setReferenceSpaceType("local");
     container.appendChild(renderer.domElement);
 
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    roomEnvironment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+    scene.environment = roomEnvironment;
+    scene.environmentIntensity = 0.3;
+
+    roomAnchor = new RoomAnchor(group);
+
     renderer.xr.addEventListener("sessionstart", ()=>{
         // Set small initial scale (actual oxDNA scale)
         group.scale.multiplyScalar(8.518E-10);
+        roomAnchor.onSessionStart(
+            renderer.xr.getSession(), renderer.xr.getReferenceSpace()
+        );
     });
 
     renderer.xr.addEventListener("sessionend", ()=>{
         // Controllers are no longer tracked, so release their pulls and
         // highlights
-        if (system !== undefined) {
-            releaseAllPulls();
-        }
+        setMoveMode(false);
+        releaseAllPulls();
+        roomAnchor.onSessionEnd();
     });
 
     document.body.appendChild(XRButton.createButton(renderer, {
-        optionalFeatures: ["light-estimation"]
+        optionalFeatures: ["light-estimation", "anchors"]
     }));
 
     // Don't add the XREstimatedLight to the scene initially.
@@ -406,6 +589,7 @@ const init = () => {
         // Swap the lights back when we stop receiving estimated values.
         scene.add(defaultLight);
         scene.remove(xrLight);
+        scene.environment = roomEnvironment;
     });
 
     // controllers
@@ -432,10 +616,14 @@ const init = () => {
     );
     scene.add(controllerGrip2);
 
+    movePanel = new MovePanel();
+
     const geometry = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(0, 0, 0),
         new THREE.Vector3(0, 0, -1)
     ]);
+
+    const pullSphereGeometry = new THREE.SphereGeometry(1, 16, 12);
 
     [controller1, controller2].forEach(c=>{
         c.addEventListener("selectstart", onSelectStart);
@@ -468,6 +656,21 @@ const init = () => {
         cone.visible = false;
         scene.add(cone);
         c.userData.cone = cone;
+
+        // Shows the region a pull acts on (unit radius, scaled to
+        // PULL_RADIUS each frame)
+        const sphere = new THREE.Mesh(
+            pullSphereGeometry,
+            new THREE.MeshBasicMaterial({
+                color: controllerColors[c.name],
+                wireframe: true,
+                transparent: true,
+                opacity: 0.35
+            })
+        );
+        sphere.visible = false;
+        scene.add(sphere);
+        c.userData.sphere = sphere;
     });
 
     window.addEventListener("resize", onWindowResize);
@@ -528,8 +731,17 @@ function updateHover(controller) {
 
     if (hit === undefined) {
         line.scale.z = 5;
+        // While pulling, the sphere stays on the pulled region
+        if (!forces.has(controller)) {
+            controller.userData.sphere.visible = false;
+        }
         setHighlight(controller, undefined);
         return;
+    }
+
+    // Show the region a pull from here would act on
+    if (!forces.has(controller)) {
+        placePullSphere(controller, hit.index);
     }
 
     // Continuous haptic pulse while pointing at the same bead
@@ -541,30 +753,59 @@ function updateHover(controller) {
     line.scale.z = hit.distance;
 }
 
+// Centre a controller's pull sphere on a bead
+function placePullSphere(controller, index) {
+    const sphere = controller.userData.sphere;
+    system.getDisplayedPosition(index, sphere.position);
+    system.instancedMesh.localToWorld(sphere.position);
+    // The mesh is unscaled inside the (uniformly scaled) group
+    sphere.scale.setScalar(PULL_RADIUS * group.scale.x);
+    sphere.visible = true;
+}
+
 // Point each pull cone from its target to the pulled bead
 function updateCones() {
     for (const [controller, f] of forces) {
         system.getDisplayedPosition(f.nucId, _beadPos);
         system.instancedMesh.localToWorld(_beadPos);
         positionCone(controller.userData.cone, f.target, _beadPos);
+        placePullSphere(controller, f.nucId);
     }
 }
 
-function render() {
+function render(time, frame) {
+    const now = performance.now();
+
+    // Place the structure first: held by hand or fixed in the room
+    if (renderer.xr.isPresenting) {
+        pollMenuButton();
+        roomAnchor.holding = grab !== undefined;
+        roomAnchor.update(frame, renderer.xr.getReferenceSpace());
+        if (moveMode) {
+            updatePanelHover();
+            if (grab !== undefined) {
+                updateGrab();
+            }
+        }
+    }
+
     if (system !== undefined && system.instancedMesh !== undefined) {
-        system.updateView(performance.now());
+        system.updateView(now);
         if (forces.size > 0) {
             updateCones();
         }
 
         // Controllers only exist in an XR session
-        if (renderer.xr.isPresenting) {
+        if (renderer.xr.isPresenting && !moveMode) {
             updateHover(controller1);
             updateHover(controller2);
         }
     }
 
     group.scale.lerp(targetScale, 0.01);
+
+    keyLight.target.position.copy(group.position);
+    keyLight.position.copy(group.position).add(KEY_LIGHT_OFFSET);
 
     renderer.render(scene, camera);
 }

@@ -74,10 +74,13 @@ let boxHelpers = [];
 // The structures that can be loaded from the menu (files in
 // public/resources/, and the name shown)
 const DESIGNS = [
+    {file: "flappy.oxview", name: "flappy"},
     {file: "flippy_turned.oxview", name: "flippy"},
     {file: "monohole_1b.oxview", name: "monohole"}
 ];
-const DESIGN_KEY = "oxjenga-design";
+// Renamed when the default changes, so that the new default is loaded once
+// even where an older choice was stored
+const DESIGN_KEY = "oxjenga-design-2";
 // The structure shown in the menu, and the one actually loaded. Starts
 // with the one loaded last time.
 let selectedDesign = Math.max(
@@ -804,6 +807,16 @@ const initSceneFromJSON = (txt) => {
             monomer.pair = newSystem.elements.get(monomerData.bp);
         });
     });
+    // Some exports list only one neighbour per nucleotide (e.g. only n3):
+    // complete each link from the other side
+    for (const monomer of newSystem.elements.values()) {
+        if (monomer.n3 !== undefined && monomer.n3.n5 === undefined) {
+            monomer.n3.n5 = monomer;
+        }
+        if (monomer.n5 !== undefined && monomer.n5.n3 === undefined) {
+            monomer.n5.n3 = monomer;
+        }
+    }
     newSystem.placeInBox();
     newSystem.assignIndices();
 

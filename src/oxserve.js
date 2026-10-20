@@ -1,4 +1,21 @@
 import {dna_relax_scenario, rna_relax_scenario} from "./relax_scenarios.js";
+
+// After this long (ms) without recognising the new run's first frame, the
+// run is no longer reported as starting
+const START_TIMEOUT = 60000;
+
+// The header line ("t = ...") of the configuration in a raw oxServe
+// message, or undefined if it has none. Only looks at the start of the
+// (multi-MB) dat string.
+function frameHeader(text) {
+    const key = text.indexOf("\"dat_file\"");
+    if (key === -1) {
+        return undefined;
+    }
+    const start = text.indexOf("\"", text.indexOf(":", key + 10)) + 1;
+    const end = text.indexOf("\\n", start);
+    return text.slice(start, end).trim();
+}
 export class OXServeSocket extends WebSocket{
     constructor(url, system, top, dat, type="DNA") {
         super(url);
@@ -21,6 +38,18 @@ export class OXServeSocket extends WebSocket{
         // Incremented on every (re)start, so that frames of an aborted run
         // still being parsed in the worker can be told apart
         this.run = 0;
+        this.intentionalClose = false;
+        // Set from a (re)start until the new run's first frame arrives, to
+        // show that oxServe is starting a run (10-20 s for a large
+        // structure). Only an indicator: all frames are applied as before,
+        // including late ones of the aborted run. The new run's first frame
+        // is the configuration it was started from, so it is recognised by
+        // its "t = ..." header line.
+        this.starting = false;
+        this.startHeader = undefined;
+        this.startedAt = 0;
+        // When the last frame arrived
+        this.lastFrameAt = 0;
 
         this.onopen = (resonse) => {
             console.log("connected to nanobase", resonse);
@@ -46,8 +75,14 @@ export class OXServeSocket extends WebSocket{
                 // is only parsed here if the simulation needs to be
                 // restarted. The key precedes the (multi-MB) value, so
                 // this check only scans the start of the message.
-                if (response.data.indexOf("\"dat_file\"") !== -1) {
+                const header = frameHeader(response.data);
+                if (header !== undefined) {
                     this.latestMessage = response.data;
+                    this.lastFrameAt = performance.now();
+                    if (this.starting && (header === this.startHeader ||
+                        this.lastFrameAt - this.startedAt > START_TIMEOUT)) {
+                        this.starting = false;
+                    }
                 }
                 const msg = {
                     type: "message",
@@ -80,6 +115,7 @@ export class OXServeSocket extends WebSocket{
         this.onclose = () => {
             console.log("lost oxServe Connection");
             this.abort = true;
+            this.starting = false;
             this.worker.terminate();
         };
         this.top = top;
@@ -131,39 +167,24 @@ export class OXServeSocket extends WebSocket{
         }
         conf["top_file"] = this.top;
         conf["dat_file"] = this.get_latest_dat();
+        this.starting = true;
+        this.startedAt = performance.now();
+        this.startHeader = conf["dat_file"].slice(0, conf["dat_file"].indexOf("\n")).trim();
         this.send(
             JSON.stringify(conf)
         );
     }
 
-    // Abort the current run and start again from the latest configuration
-    restart_simulation() {
-        if (this.readyState === WebSocket.OPEN) {
-            this.send("abort");
-        }
-        this.start_simulation();
-    }
-
-    update_forces(forces) {
-        if (this.forces === forces) {
-            console.log("Forces do not need to be updated");
-            return;
-        }
-        this.forces = forces;
-        // Restart from the latest configuration with the new forces
-        this.restart_simulation();
-    }
-
-    // Continue the simulation from a given configuration (e.g. a dropped
-    // dat file)
-    load_dat(dat) {
-        this.dat = dat;
-        this.latestMessage = undefined;
-        this.restart_simulation();
+    // Whether oxServe is still starting the current run (until its first
+    // frame, or at most START_TIMEOUT)
+    isStarting(now = performance.now()) {
+        return this.starting && now - this.startedAt < START_TIMEOUT;
     }
 
     // Stop the server-side run before disconnecting
     shutdown() {
+        // Not a lost connection, so nothing should reconnect
+        this.intentionalClose = true;
         this.stop_simulation();
         this.close();
     }

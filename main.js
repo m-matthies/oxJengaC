@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { XRButton } from "three/addons/webxr/XRButton.js";
 import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
+import { XRHandModelFactory } from "three/addons/webxr/XRHandModelFactory.js";
 import {
     makeDatFile,
     makeFileDropable,
@@ -16,6 +17,10 @@ import { establishConnection } from "./src/oxserve.js";
 import { drawBox, drawCone, positionCone } from "./src/utils.js";
 import { MovePanel } from "./src/movePanel.js";
 import { RoomAnchor } from "./src/roomAnchor.js";
+import { readPositions } from "./src/datParser.js";
+import {
+    handGrabMatrix, jointPosition, pinchPoint
+} from "./src/hands.js";
 
 import {
     DNAMonomer, RNAMonomer, AminoAcidMonomer,
@@ -25,8 +30,99 @@ import {
 // Pulls act on every bead within this radius of the picked one, in oxDNA
 // length units (1 unit = 0.8518 nm). About the radius of a six-helix bundle.
 const PULL_RADIUS = 5.2;
-// Total trap stiffness of one pull, shared evenly by all of its beads
-const PULL_STIFFNESS = 0.15;
+// Total trap stiffness of one pull, shared evenly by all of its beads, so
+// the region is pulled gently as a whole. It is chosen in the menu from
+// these steps and remembered per browser.
+const STIFFNESS_STEPS = [0.05, 0.1, 0.15, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
+const DEFAULT_STIFFNESS = 0.15;
+const STIFFNESS_KEY = "oxjenga-stiffness";
+// A hand's pinch selects the nearest bead within this distance (metres) of
+// the pinch point (hands have no pointing ray)
+const HAND_REACH = 0.03;
+
+// A stored setting, or null if there is none or storage is unavailable
+function loadSetting(key) {
+    try {
+        return localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function loadStiffness() {
+    const value = parseFloat(loadSetting(STIFFNESS_KEY));
+    return STIFFNESS_STEPS.includes(value) ? value : DEFAULT_STIFFNESS;
+}
+
+function saveSetting(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch {
+        // Storage unavailable, the choice lasts until reload
+    }
+}
+
+let pullStiffness = loadStiffness();
+// Set when the stiffness was changed while the menu is open
+let stiffnessChanged = false;
+
+// Whether the simulation box (and axes) are shown, chosen in the menu
+const BOX_KEY = "oxjenga-show-box";
+let boxVisible = loadSetting(BOX_KEY) !== "0";
+let boxHelpers = [];
+
+// The structures that can be loaded from the menu (files in
+// public/resources/, and the name shown)
+const DESIGNS = [
+    {file: "flippy_turned.oxview", name: "flippy"},
+    {file: "monohole_1b.oxview", name: "monohole"}
+];
+const DESIGN_KEY = "oxjenga-design";
+// The structure shown in the menu, and the one actually loaded. Starts
+// with the one loaded last time.
+let selectedDesign = Math.max(
+    0, DESIGNS.findIndex(d => d.file === loadSetting(DESIGN_KEY))
+);
+let loadedDesign;
+// Incremented per load, so only the latest requested design is shown
+let designLoadId = 0;
+
+const designName = (i) => DESIGNS[i].name;
+
+function updateDesignMenu() {
+    movePanel.setDesign(designName(selectedDesign), selectedDesign === loadedDesign);
+}
+
+// Fetch and show a design, and start simulating it. The current one keeps
+// running until the new one has been parsed.
+function loadDesign(index) {
+    const id = ++designLoadId;
+    const name = designName(index);
+    console.log(`Loading ${DESIGNS[index].file}`);
+    if (movePanel !== undefined) {
+        movePanel.setStatus(`Loading ${name}\u2026`);
+    }
+    fetch(import.meta.env.BASE_URL + "resources/" + DESIGNS[index].file).then(resp => {
+        if (!resp.ok) {
+            throw new Error(`${resp.status} ${resp.statusText}`);
+        }
+        return resp.text();
+    }).then(text => {
+        if (id !== designLoadId) {
+            return;
+        }
+        initSceneFromJSON(text);
+        loadedDesign = index;
+        saveSetting(DESIGN_KEY, DESIGNS[index].file);
+        movePanel.setStatus("");
+        updateDesignMenu();
+    }).catch(error => {
+        console.error(`Could not load ${DESIGNS[index].file}`, error);
+        if (id === designLoadId) {
+            movePanel.setStatus(`Could not load ${name}`);
+        }
+    });
+}
 
 // Gamepad buttons of the left controller that open the move window: X and
 // Y, plus anything after the thumbrest (where some runtimes report the
@@ -38,9 +134,23 @@ const _ray = new THREE.Ray();
 const _hit = {};
 const _rotation = new THREE.Matrix4();
 const _beadPos = new THREE.Vector3();
+const _targetPos = new THREE.Vector3();
 const _grabMatrix = new THREE.Matrix4();
 const _grabScale = new THREE.Vector3();
 const _trapPos = new THREE.Vector3();
+const _pinch = new THREE.Vector3();
+const _pinchLocal = new THREE.Vector3();
+const _head = new THREE.Vector3();
+// Where the "Starting simulation" label floats, relative to the structure
+const LABEL_OFFSET = new THREE.Vector3(0, 0.8, 0);
+const _headDir = new THREE.Vector3();
+const _placeDir = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _viewerRotation = new THREE.Quaternion();
+// Where a structure is first put: this far (metres) beyond its own radius
+// in front of the viewer, and this far below eye level
+const VIEWER_CLEARANCE = 0.75;
+const BELOW_EYE_LEVEL = 0.2;
 
 // Direction of the key light from the structure
 const KEY_LIGHT_OFFSET = new THREE.Vector3(1, 3, 2);
@@ -85,50 +195,128 @@ function onSelectStart(event) {
         return;
     }
 
+    // Hands only grab what they touch: a pinch right at the structure
+    // grabs that region. It is dragged until the pinch opens and then
+    // pulled toward that point (one simulation restart per gesture).
+    if (isHand(controller)) {
+        // Fingertips not tracked: neither a grab nor an empty-space pinch
+        if (pinchPoint(controller.userData.hand, _pinch) === undefined) {
+            return;
+        }
+        const direct = directPick(controller);
+        if (direct !== undefined) {
+            controller.userData.selected = direct;
+            controller.userData.drag = direct;
+            controller.userData.cone.visible = true;
+        } else {
+            releasePull(controller);
+        }
+        return;
+    }
+
     const hit = pickFromController(controller);
     if (hit === undefined) {
         // Pointing at nothing releases this controller's pull
-        if (forces.has(controller)) {
-            controller.userData.cone.visible = false;
-            controller.userData.sphere.visible = false;
-            forces.delete(controller);
-            sendForces();
-        }
+        releasePull(controller);
         return;
     }
 
     controller.userData.selected = hit.index;
 
-    // Pull toward where the controller is now. The pull stays until the
-    // controller selects empty space (or another region).
-    const target = controller.position.clone();
+    // Pull toward where the controller (or pinch) is now. The pull stays
+    // until the controller selects empty space (or another region).
+    startPull(controller, hit.index, inputPosition(controller).clone());
+    sendForces();
+}
 
+// Stop a controller's (or hand's) pull, if it has one
+function releasePull(controller) {
+    if (forces.has(controller)) {
+        controller.userData.cone.visible = false;
+        controller.userData.sphere.visible = false;
+        forces.delete(controller);
+        sendForces();
+    }
+}
+
+function isHand(controller) {
+    const source = controller.userData.inputSource;
+    return source !== undefined && source.hand !== undefined && source.hand !== null;
+}
+
+// Where an input is: a hand's pinch point, or the controller itself
+function inputPosition(controller) {
+    if (isHand(controller) &&
+        pinchPoint(controller.userData.hand, _pinch) !== undefined) {
+        return _pinch;
+    }
+    return controller.position;
+}
+
+// What a controller pokes with: a hand's index finger tip, or the
+// controller itself
+function pokeTip(controller) {
+    if (isHand(controller)) {
+        return jointPosition(controller.userData.hand, "index-finger-tip");
+    }
+    return controller.userData.inputSource ? controller.position : undefined;
+}
+
+// The bead within reach of a hand's pinch point, if any
+function directPick(controller) {
+    if (system === undefined || !isHand(controller) ||
+        pinchPoint(controller.userData.hand, _pinchLocal) === undefined) {
+        return undefined;
+    }
+    system.instancedMesh.worldToLocal(_pinchLocal);
+    // The mesh is unscaled inside the (uniformly scaled) group
+    return system.nearestDisplayed(_pinchLocal, HAND_REACH / group.scale.x);
+}
+
+// Pull the region around a bead toward a world position
+function startPull(controller, index, target) {
     // Pull every bead within PULL_RADIUS of the picked one. Each keeps its
     // offset from the picked bead, so the region is moved as a whole
     // instead of one bead being torn out.
-    const center = system.getTargetPosition(hit.index);
+    const center = system.getTargetPosition(index);
     const particles = system.getIndicesWithin(center, PULL_RADIUS);
+    // oxDNA applies traps to the particles' centres of mass, not to the
+    // backbone sites that are drawn, so the offsets are taken from the
+    // centres of mass in the configuration the restart will start from
+    // (the same frame the restart sends). The picked bead's centre of mass
+    // is pulled to the target.
     const offsets = new Float32Array(3 * particles.length);
-    particles.forEach((i, k) => {
-        system.getTargetPosition(i, _trapPos).sub(center).toArray(offsets, 3 * k);
-    });
+    const picked = particles.indexOf(index);
+    if (readPositions(ox_socket.get_latest_dat(), particles, offsets) === particles.length) {
+        const cx = offsets[3 * picked];
+        const cy = offsets[3 * picked + 1];
+        const cz = offsets[3 * picked + 2];
+        for (let k = 0; k < offsets.length; k += 3) {
+            offsets[k] -= cx;
+            offsets[k + 1] -= cy;
+            offsets[k + 2] -= cz;
+        }
+    } else {
+        // Configuration unreadable: fall back to the backbone sites
+        particles.forEach((i, k) => {
+            system.getTargetPosition(i, _trapPos).sub(center).toArray(offsets, 3 * k);
+        });
+    }
     forces.set(controller, {
-        nucId: hit.index,
+        nucId: index,
         particles: particles,
         offsets: offsets,
-        stiff: PULL_STIFFNESS / particles.length,
-        // The target in world and in oxDNA coordinates
-        target: target,
+        // Shared by the region, so the pull is gentle
+        stiff: pullStiffness / particles.length,
+        // The target in oxDNA coordinates, so it moves with the structure
         oxDNATarget: system.instancedMesh.worldToLocal(target.clone())
     });
 
-    console.log(`Pull ${particles.length} particles around ${hit.index}`);
+    console.log(`Pull ${particles.length} particles around ${index}`);
 
     // Show the "tractor beam" cone
     controller.userData.cone.visible = true;
     updateCones();
-
-    sendForces();
 }
 
 // Send the current pulls to oxDNA as trap forces
@@ -139,13 +327,59 @@ function sendForces() {
         )
     ).join("\n")).join("\n");
 
-    // Send new forces to oxDNA
-    ox_socket.update_forces(forceStr);
+    if (forceStr === ox_socket.forces && !connectionLost()) {
+        console.log("Forces do not need to be updated");
+        return;
+    }
+    restartSimulation(ox_socket.get_latest_dat(), forceStr);
+}
+
+// Restart the simulation from `dat` with the given trap forces, on a fresh
+// oxServe connection. oxServe kills the old run, but frames the dying run
+// still sends would arrive on the old connection: shown, they would move
+// the structure on without the new forces and then snap it back when the
+// new run starts from `dat`. A fresh connection never receives them, so
+// the structure holds still until the new run starts.
+//
+// The new connection is only opened once the old one has closed (or after
+// RESTART_CLOSE_WAIT), so that oxServe never counts both against its
+// connection limit. A restart requested meanwhile replaces the pending one.
+function restartSimulation(dat, forceStr) {
+    const waiting = pendingRestart !== undefined;
+    pendingRestart = {dat, forceStr};
+    if (waiting) {
+        return;
+    }
+    const old = ox_socket;
+    const go = () => {
+        if (pendingRestart === undefined || ox_socket !== old) {
+            return;
+        }
+        const {dat, forceStr} = pendingRestart;
+        pendingRestart = undefined;
+        connect(dat, forceStr);
+    };
+    if (old.readyState === WebSocket.CLOSED) {
+        go();
+        return;
+    }
+    old.addEventListener("close", go, {once: true});
+    setTimeout(go, RESTART_CLOSE_WAIT);
+    old.shutdown();
 }
 
 function onSelectEnd(event) {
     const controller = event.target;
     controller.userData.selected = undefined;
+    if (controller.userData.drag !== undefined) {
+        // Drop: pull the dragged region toward where the pinch opened
+        const index = controller.userData.drag;
+        controller.userData.drag = undefined;
+        if (system !== undefined) {
+            startPull(controller, index, inputPosition(controller).clone());
+            sendForces();
+        }
+    }
     if (grab !== undefined && grab.controller === controller) {
         // Place the structure where it is, and keep it there
         grab = undefined;
@@ -170,44 +404,223 @@ function leftController() {
 // whole structure instead of pulling beads.
 function setMoveMode(on) {
     moveMode = on;
-    grab = undefined;
     if (on) {
-        // Pull targets are fixed in the room, so let go before moving
-        releaseAllPulls();
-        leftController().add(movePanel.mesh);
+        // Pulls stay on (no simulation restart). Their targets are in the
+        // structure's coordinates, so they move along with it.
+        stopInteractions();
+        placeMenu();
     }
+    grab = undefined;
     movePanel.mesh.visible = on;
     movePanel.setHovered(undefined);
     movePanel.setStatus("");
+    movePanel.setStiffness(pullStiffness);
+    movePanel.setLabel("toggleBox", boxVisible ? "Hide box" : "Show box");
+    updateDesignMenu();
+    updateConnectionStatus(performance.now());
+}
+
+// Put the structure in front of a viewer at `head` looking along
+// `direction`: far enough that it is not in their face, a little below eye
+// level, and turned to face them (yaw only)
+function placeInFrontOf(head, direction) {
+    _placeDir.set(direction.x, 0, direction.z);
+    if (_placeDir.lengthSq() < 1e-6) {
+        _placeDir.set(0, 0, -1);
+    }
+    _placeDir.normalize();
+    // Clear of the structure's own extent (its bounding sphere, scaled to
+    // the room)
+    const radius = system !== undefined ?
+        system.instancedMesh.boundingSphere.radius * group.scale.x : 0.75;
+    group.position.copy(head).addScaledVector(_placeDir, radius + VIEWER_CLEARANCE);
+    group.position.y = head.y - BELOW_EYE_LEVEL;
+    group.quaternion.setFromAxisAngle(_up, Math.atan2(-_placeDir.x, -_placeDir.z));
+}
+
+// End everything that lasts only while a trigger or pinch is held:
+// grabbing the structure, dragging a region and hover highlights. Pulls
+// stay.
+function stopInteractions() {
+    grab = undefined;
+    for (const c of [controller1, controller2]) {
+        c.userData.selected = undefined;
+        c.userData.drag = undefined;
+        if (!forces.has(c)) {
+            c.userData.cone.visible = false;
+            c.userData.sphere.visible = false;
+        }
+        if (system !== undefined) {
+            setHighlight(c, undefined);
+        }
+    }
+}
+
+// Put the menu by the left controller, or for a hand (which gives no stable
+// place to attach it to) in the room in front of the viewer
+function placeMenu() {
+    menuNeedsPlacement = false;
+    const left = leftController();
+    if (isHand(left)) {
+        const xrCamera = renderer.xr.getCamera();
+        _head.setFromMatrixPosition(xrCamera.matrixWorld);
+        _headDir.set(0, 0, -1).transformDirection(xrCamera.matrixWorld);
+        movePanel.placeInFront(scene, _head, _headDir);
+    } else {
+        movePanel.attachTo(left);
+    }
+}
+
+// The system took over the session (e.g. its menu, opened with the palm
+// pinch gesture of a tracked hand) or gave it back. Coming back with hands,
+// our menu is opened: Quest keeps that gesture for itself, so this is how
+// it opens the menu as the controller's menu button does.
+function onSessionVisibilityChange(event) {
+    const visible = event.session.visibilityState === "visible";
+    if (!visible) {
+        sessionBlurred = true;
+        // No select end comes while the system has the inputs
+        stopInteractions();
+        return;
+    }
+    if (sessionBlurred && isHand(leftController()) && !moveMode) {
+        setMoveMode(true);
+    }
+    sessionBlurred = false;
+}
+
+function menuAction(button) {
+    switch (button) {
+    case "resetPosition":
+        if (renderer.xr.isPresenting) {
+            const xrCamera = renderer.xr.getCamera();
+            _head.setFromMatrixPosition(xrCamera.matrixWorld);
+            _headDir.set(0, 0, -1).transformDirection(xrCamera.matrixWorld);
+            placeInFrontOf(_head, _headDir);
+        } else {
+            group.position.set(0, 0, 0);
+            group.quaternion.identity();
+        }
+        roomAnchor.requestPlacement();
+        break;
+    case "resetStructure":
+        // Back to the starting configuration, where the structure is now
+        // and without pulls, in a single restart
+        if (system !== undefined) {
+            releaseAllPulls(false);
+            updateStrandsFromDat(initialDat, system);
+            restartSimulation(initialDat, "");
+        }
+        break;
+    case "toggleBox":
+        boxVisible = !boxVisible;
+        saveSetting(BOX_KEY, boxVisible ? "1" : "0");
+        for (const helper of boxHelpers) {
+            helper.visible = boxVisible;
+        }
+        movePanel.setLabel("toggleBox", boxVisible ? "Hide box" : "Show box");
+        break;
+    case "stiffDown":
+    case "stiffUp": {
+        const i = STIFFNESS_STEPS.indexOf(pullStiffness) +
+            (button === "stiffUp" ? 1 : -1);
+        pullStiffness = STIFFNESS_STEPS[
+            Math.min(Math.max(i, 0), STIFFNESS_STEPS.length - 1)
+        ];
+        saveSetting(STIFFNESS_KEY, String(pullStiffness));
+        movePanel.setStiffness(pullStiffness);
+        stiffnessChanged = true;
+        break;
+    }
+    case "designPrev":
+    case "designNext":
+        selectedDesign = (selectedDesign + (button === "designNext" ? 1 : -1) +
+            DESIGNS.length) % DESIGNS.length;
+        updateDesignMenu();
+        break;
+    case "designLoad":
+        loadDesign(selectedDesign);
+        break;
+    case "reconnect":
+        // A fresh connection, continuing from the latest configuration
+        // with the current pulls
+        if (ox_socket !== undefined) {
+            reconnectTimes.length = 0;
+            restartSimulation(ox_socket.get_latest_dat(), ox_socket.forces);
+        }
+        break;
+    case "exitXR": {
+        // Leave the immersive session (Quest's own quit needs a short palm
+        // pinch with hands, which easily turns into a recenter instead).
+        // Pulls, menu and placement are kept for coming back.
+        const session = renderer.xr.getSession();
+        if (session) {
+            session.end();
+        }
+        break;
+    }
+    case "done":
+        setMoveMode(false);
+        // A changed stiffness also applies to the active pulls (one restart)
+        if (stiffnessChanged && forces.size > 0) {
+            for (const f of forces.values()) {
+                f.stiff = pullStiffness / f.particles.length;
+            }
+            sendForces();
+        }
+        stiffnessChanged = false;
+        break;
+    default:
+        return;
+    }
+    for (const c of [controller1, controller2]) {
+        pulse(c);
+    }
+}
+
+// The pose to carry the structure with: a hand's pinch point turning with
+// its wrist, or the controller's pose
+function grabFrame(controller) {
+    if (isHand(controller)) {
+        return handGrabMatrix(controller.userData.hand, _grabMatrix);
+    }
+    return _grabMatrix.copy(controller.matrix);
 }
 
 function onMoveSelectStart(controller) {
-    const panelHit = movePanel.hitTest(controllerRay(controller));
+    // Hands use the menu by poking it
+    const panelHit = isHand(controller) ?
+        undefined : movePanel.hitTest(controllerRay(controller));
     if (panelHit !== undefined) {
-        if (panelHit.button === "reset") {
-            group.position.set(0, 0, 0);
-            group.quaternion.identity();
-            roomAnchor.requestPlacement();
-        } else if (panelHit.button === "done") {
-            setMoveMode(false);
-        }
+        menuAction(panelHit.button);
         return;
     }
-    // Grab: keep the structure's pose relative to the controller
+    const frame = grabFrame(controller);
+    if (frame === undefined) {
+        return;
+    }
+    // Grab: keep the structure's pose relative to the controller or hand
     group.updateMatrix();
     grab = {
         controller: controller,
-        offset: controller.matrix.clone().invert().multiply(group.matrix)
+        offset: frame.clone().invert().multiply(group.matrix)
     };
     pulse(controller);
-    movePanel.setStatus("Release the trigger to place");
+    movePanel.setStatus(
+        isHand(controller) ? "Open the pinch to place" : "Release the trigger to place"
+    );
 }
 
-// Carry the grabbed structure along with the controller
+// Carry the grabbed structure along with the controller or hand
 function updateGrab() {
-    _grabMatrix.multiplyMatrices(grab.controller.matrix, grab.offset);
-    // The scale is left to the zoom-in lerp in render()
-    _grabMatrix.decompose(group.position, group.quaternion, _grabScale);
+    const frame = grabFrame(grab.controller);
+    // Keep still while the hand is not tracked
+    if (frame === undefined) {
+        return;
+    }
+    frame.multiply(grab.offset);
+    // Only position and rotation are carried, the scale stays fixed
+    frame.decompose(group.position, group.quaternion, _grabScale);
 }
 
 // Open the move window on a press of the left controller's menu button
@@ -217,8 +630,12 @@ function pollMenuButton() {
     let pressed = false;
     if (source && source.gamepad) {
         const buttons = source.gamepad.buttons;
+        // A hand's emulated gamepad has the pinch (select) as button 0 and
+        // may report a grasp as squeeze (1); any later button is taken as
+        // its menu gesture
+        const hand = isHand(controller);
         for (let i = 0; i < buttons.length; i++) {
-            if (isMenuButton(i) && buttons[i].pressed) {
+            if ((hand ? i > 1 : isMenuButton(i)) && buttons[i].pressed) {
                 pressed = true;
             }
         }
@@ -229,33 +646,54 @@ function pollMenuButton() {
     controller.userData.menuPressed = pressed;
 }
 
-// Point the controller rays at the move window and highlight its buttons
+// Point rays at or poke the menu, highlight its buttons and run poked ones
 function updatePanelHover() {
     let hovered;
     for (const c of [controller1, controller2]) {
-        const hit = movePanel.hitTest(controllerRay(c));
-        c.userData.line.scale.z = hit === undefined ? 5 : hit.distance;
-        if (hit !== undefined && hit.button !== undefined) {
-            hovered = hit.button;
+        if (!isHand(c)) {
+            const hit = movePanel.hitTest(controllerRay(c));
+            c.userData.line.scale.z = hit === undefined ? 5 : hit.distance;
+            if (hit !== undefined && hit.button !== undefined) {
+                hovered = hit.button;
+            }
+        }
+        const tip = pokeTip(c);
+        if (tip === undefined) {
+            // Untracked: no highlight. A press stays down until the tip is
+            // seen away from the panel, so it cannot click twice.
+            c.userData.poke.hovered = undefined;
+        }
+        const poked = tip === undefined ? undefined : movePanel.poke(tip, c.userData.poke);
+        if (c.userData.poke.hovered !== undefined) {
+            hovered = c.userData.poke.hovered;
+        }
+        if (poked !== undefined) {
+            menuAction(poked);
+            if (!moveMode) {
+                return;
+            }
         }
     }
     movePanel.setHovered(hovered);
 }
 
-// Let go of everything, e.g. when the XR session ends (no selectend fires
-// then, even if a trigger is held)
-function releaseAllPulls() {
+// Let go of all pulls and held interactions. Unless `send` is false, the
+// simulation is restarted without the pulls.
+function releaseAllPulls(send = true) {
     for (const c of [controller1, controller2]) {
         c.userData.cone.visible = false;
         c.userData.sphere.visible = false;
         c.userData.selected = undefined;
+        c.userData.drag = undefined;
         if (system !== undefined) {
             setHighlight(c, undefined);
         }
     }
     if (forces.size > 0) {
         forces.clear();
-        sendForces();
+        if (send) {
+            sendForces();
+        }
     }
 }
 
@@ -270,6 +708,13 @@ const forces = new Map();
 // structure with the structure's pose relative to it
 let moveMode = false;
 let movePanel;
+// Set when the open menu has to be placed again (new session, or the
+// inputs switched between hands and controllers)
+let menuNeedsPlacement = false;
+// Set while the system (e.g. its menu) has taken over the XR session
+let sessionBlurred = false;
+// Shown while oxServe is starting a run
+let startingLabel;
 let grab;
 // Keeps the structure fixed in the room
 let roomAnchor;
@@ -281,6 +726,22 @@ let keyLight, roomEnvironment;
 let box;
 let system;
 let ox_socket;
+// The starting configuration, for resetting the structure, and what is
+// needed to reconnect to oxServe
+let initialDat, initialTop, simulationType;
+let anchorStatus = "none";
+// After this long (ms) without a frame, a running simulation is reported
+// as stalled
+const STALLED_AFTER = 20000;
+// When the connection was re-established, to stop retrying a server that
+// keeps dropping it
+const reconnectTimes = [];
+const MAX_RECONNECTS_PER_MINUTE = 3;
+const RECONNECT_DELAY = 2000;
+// A restart waiting for the old connection to close, and how long (ms) it
+// waits at most
+let pendingRestart;
+const RESTART_CLOSE_WAIT = 1000;
 
 const targetScale = new THREE.Vector3(1/100, 1/100, 1/100);
 
@@ -348,11 +809,8 @@ const initSceneFromJSON = (txt) => {
 
     newSystem.createViewMesh();
 
-    // Drop everything that belongs to the previous system
-    if (ox_socket !== undefined) {
-        // Stop the server-side run before disconnecting
-        ox_socket.shutdown();
-    }
+    // Drop everything that belongs to the previous system. Its connection
+    // is closed by restartSimulation below.
     if (system !== undefined) {
         system.dispose();
     }
@@ -362,6 +820,7 @@ const initSceneFromJSON = (txt) => {
         // Highlights belonged to the old system's colours
         c.userData.highlighted = undefined;
         c.userData.selected = undefined;
+        c.userData.drag = undefined;
     }
     forces.clear();
 
@@ -387,25 +846,101 @@ const initSceneFromJSON = (txt) => {
 
     group.add(boxMesh);
     group.add(axesHelper);
+    boxHelpers = [boxMesh, axesHelper];
+    for (const helper of boxHelpers) {
+        helper.visible = boxVisible;
+    }
 
     //generate its description in oxDNA world
     let top_file = makeTopFile(system);
     let dat_file = makeDatFile(system);
+    initialDat = dat_file;
 
     // Establish oxServe connection and update cycles here
-    ox_socket = establishConnection(
-        system, top_file, dat_file,
-        // TODO: Check more than just one monomer
-        system.strands[0].monomers[0].getCategory()
-    );
-    console.log(ox_socket);
-    window.socket = ox_socket;
-
-    // Waits for the connection to open if needed
-    ox_socket.start_simulation();
+    initialTop = top_file;
+    // TODO: Check more than just one monomer
+    simulationType = system.strands[0].monomers[0].getCategory();
+    reconnectTimes.length = 0;
+    if (ox_socket === undefined) {
+        connect(dat_file, "");
+    } else {
+        // Replaces any restart still pending for the previous system
+        pendingRestart = undefined;
+        restartSimulation(dat_file, "");
+    }
 
     return [strands, n_monomers];
 };
+
+// Open an oxServe connection and start simulating from `dat` with the
+// given trap forces. A lost connection is re-established from the latest
+// configuration, if the page is in view and it has not kept failing.
+function connect(dat, forceStr) {
+    // The wait for the new run is not a frame interval
+    system.resetFrameTiming();
+    const socket = establishConnection(system, initialTop, dat, simulationType);
+    socket.forces = forceStr;
+    socket.addEventListener("close", () => {
+        if (socket !== ox_socket || socket.intentionalClose) {
+            return;
+        }
+        const now = performance.now();
+        // Only count recent attempts
+        while (reconnectTimes.length > 0 && now - reconnectTimes[0] > 60000) {
+            reconnectTimes.shift();
+        }
+        if (document.visibilityState !== "visible" ||
+            reconnectTimes.length >= MAX_RECONNECTS_PER_MINUTE) {
+            // Retried on the next pull instead (see sendForces)
+            return;
+        }
+        reconnectTimes.push(now);
+        setTimeout(() => {
+            if (socket === ox_socket) {
+                reconnect();
+            }
+        }, RECONNECT_DELAY);
+    });
+    ox_socket = socket;
+    window.socket = socket;
+    // Waits for the connection to open if needed
+    socket.start_simulation();
+}
+
+// Continue the simulation on a new connection, from the latest
+// configuration and with the current forces
+function reconnect() {
+    console.warn("Reconnecting to oxServe");
+    const old = ox_socket;
+    connect(old.get_latest_dat(), old.forces);
+}
+
+function connectionLost() {
+    return ox_socket.readyState === WebSocket.CLOSING ||
+        ox_socket.readyState === WebSocket.CLOSED;
+}
+
+// Show the live state of the oxServe connection in the menu
+function updateConnectionStatus(now) {
+    if (movePanel === undefined) {
+        return;
+    }
+    movePanel.setInfo(`Room anchor: ${anchorStatus}`);
+    if (ox_socket === undefined) {
+        movePanel.setConnection("Not connected", "#8f9aab");
+    } else if (ox_socket.readyState === WebSocket.CONNECTING) {
+        movePanel.setConnection("Connecting\u2026", "#f5c542");
+    } else if (ox_socket.readyState !== WebSocket.OPEN) {
+        movePanel.setConnection("Disconnected", "#e5484d");
+    } else if (ox_socket.isStarting(now)) {
+        movePanel.setConnection("Starting\u2026", "#f5c542");
+    } else if (now - ox_socket.lastFrameAt > STALLED_AFTER) {
+        movePanel.setConnection("No frames", "#f08c2e");
+    } else {
+        movePanel.setConnection("Running", "#3ccf6e");
+    }
+}
+
 const init = () => {
     container = document.createElement("div");
     container.style = "background:none";
@@ -419,7 +954,7 @@ const init = () => {
             updateStrandsFromDat(text, system);
             // Continue the simulation from the dropped configuration
             if (ox_socket !== undefined) {
-                ox_socket.load_dat(text);
+                restartSimulation(text, ox_socket.forces);
             }
         });
     });
@@ -470,49 +1005,6 @@ const init = () => {
     defaultLight.add(rimLight);
     scene.add(defaultLight);
 
-    class DesignStorage {
-        constructor() {
-            this.counter = 0;
-
-            this.designs = [
-                "flippy_turned.oxview",
-                //"flippy.oxview",
-                //"monohole_1b.oxview",
-                //"6-bar.oxview",
-                //"hairygami.oxview",
-                //"hairpin.oxview",
-                //"Leaf.oxview",
-                //"moon.oxview",
-                //"meta.oxview",
-                //"gated-channel.oxview",
-                //"gripper.oxview",
-                //"teather.oxview",
-                //"planeV3.oxview",
-                //"1eua.oxview",
-                //"rna_crossover.oxview"
-            ].map(p => import.meta.env.BASE_URL + "resources/" + p);
-        }
-        getCurrent() {
-            return this.designs[this.counter];
-        }
-        getNext() {
-            this.counter += 1;
-            if (this.counter >= this.designs.length) this.counter = 0;
-            return this.designs[this.counter];
-        }
-        getPrev() {
-            this.counter -= 1;
-            if (this.counter < 0) this.counter = this.designs.length - 1;
-            return this.designs[this.counter];
-        }
-        getRand() {
-            this.counter = Math.floor(Math.random() * this.designs.length);
-            return this.designs[this.counter];
-        }
-
-    }
-
-    let designStorage = new DesignStorage();
 
     // read from nanobase might be subject to XSSS scripting issues ...
     // need to look more into it, but even oxview.org can't fetch in local
@@ -545,25 +1037,38 @@ const init = () => {
     scene.environmentIntensity = 0.3;
 
     roomAnchor = new RoomAnchor(group);
+    // No saved placement: put the structure in front of the viewer
+    roomAnchor.onInitialPose = (viewer) => {
+        _head.copy(viewer.position);
+        _headDir.set(0, 0, -1).applyQuaternion(_viewerRotation.copy(viewer.orientation));
+        placeInFrontOf(_head, _headDir);
+    };
+    roomAnchor.onStatus = (status) => {
+        anchorStatus = status;
+        if (movePanel !== undefined) {
+            movePanel.setInfo(`Room anchor: ${anchorStatus}`);
+        }
+    };
 
     renderer.xr.addEventListener("sessionstart", ()=>{
-        // Set small initial scale (actual oxDNA scale)
-        group.scale.multiplyScalar(8.518E-10);
-        roomAnchor.onSessionStart(
-            renderer.xr.getSession(), renderer.xr.getReferenceSpace()
-        );
+        const session = renderer.xr.getSession();
+        roomAnchor.onSessionStart(session, renderer.xr.getReferenceSpace());
+        session.addEventListener("visibilitychange", onSessionVisibilityChange);
+        sessionBlurred = false;
+        // An open menu is placed again once the inputs are known
+        menuNeedsPlacement = moveMode;
     });
 
     renderer.xr.addEventListener("sessionend", ()=>{
-        // Controllers are no longer tracked, so release their pulls and
-        // highlights
-        setMoveMode(false);
-        releaseAllPulls();
+        // Leaving the session (e.g. for the system menu) keeps the pulls, the
+        // open menu and the placement, so coming back continues where it
+        // left off. Only held interactions end (no select end will come).
+        stopInteractions();
         roomAnchor.onSessionEnd();
     });
 
     document.body.appendChild(XRButton.createButton(renderer, {
-        optionalFeatures: ["light-estimation", "anchors"]
+        optionalFeatures: ["light-estimation", "anchors", "hand-tracking"]
     }));
 
     // Don't add the XREstimatedLight to the scene initially.
@@ -616,7 +1121,21 @@ const init = () => {
     );
     scene.add(controllerGrip2);
 
+    // Tracked hands share their controller's events (a pinch is a select)
+    const handModelFactory = new XRHandModelFactory();
+    [controller1, controller2].forEach((c, i) => {
+        const hand = renderer.xr.getHand(i);
+        const handModel = handModelFactory.createHandModel(hand, "mesh");
+        handModel.visible = false;
+        hand.add(handModel);
+        scene.add(hand);
+        c.userData.hand = hand;
+        c.userData.handModel = handModel;
+    });
+
     movePanel = new MovePanel();
+    startingLabel = makeStartingLabel();
+    scene.add(startingLabel);
 
     const geometry = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(0, 0, 0),
@@ -628,10 +1147,14 @@ const init = () => {
     [controller1, controller2].forEach(c=>{
         c.addEventListener("selectstart", onSelectStart);
         c.addEventListener("selectend", onSelectEnd);
+        // Per controller state of poking the menu
+        c.userData.poke = {down: false, hovered: undefined};
 
         // Keep the input source, for haptic feedback
         c.addEventListener("connected", e => {
             c.userData.inputSource = e.data;
+            // Switching between hands and controllers moves the menu
+            menuNeedsPlacement = moveMode;
         });
         c.addEventListener("disconnected", () => {
             c.userData.inputSource = undefined;
@@ -676,11 +1199,19 @@ const init = () => {
     window.addEventListener("resize", onWindowResize);
 
     //load up first design
-    fetch(designStorage.getCurrent()).then(
-        resp => resp.text()
-    ).then(initSceneFromJSON);
+    loadDesign(selectedDesign);
 
     renderer.setAnimationLoop(render);
+
+    // Debugging hooks for the dev server only (stripped from builds)
+    if (import.meta.env.DEV) {
+        window.__oxjenga = {
+            get system() { return system; },
+            get socket() { return ox_socket; },
+            get group() { return group; },
+            forces, startPull, sendForces, releasePull
+        };
+    }
 };
 
 const onWindowResize = () => {
@@ -720,13 +1251,42 @@ function pulse(controller) {
 
 function updateHover(controller) {
 
+    const line = controller.userData.line;
+
+    // Dragging with a pinch: the cone runs from the pinch to the region
+    if (controller.userData.drag !== undefined) {
+        const index = controller.userData.drag;
+        system.getDisplayedPosition(index, _beadPos);
+        system.instancedMesh.localToWorld(_beadPos);
+        positionCone(controller.userData.cone, inputPosition(controller), _beadPos);
+        placePullSphere(controller, index);
+        setHighlight(controller, undefined);
+        return;
+    }
+
     // Do not highlight when already selected
     if (controller.userData.selected !== undefined) {
         setHighlight(controller, undefined);
         return;
     }
 
-    const line = controller.userData.line;
+    // A hand only highlights what is within its reach
+    if (isHand(controller)) {
+        const direct = directPick(controller);
+        if (direct === undefined) {
+            if (!forces.has(controller)) {
+                controller.userData.sphere.visible = false;
+            }
+            setHighlight(controller, undefined);
+            return;
+        }
+        if (!forces.has(controller)) {
+            placePullSphere(controller, direct);
+        }
+        setHighlight(controller, direct);
+        return;
+    }
+
     const hit = pickFromController(controller);
 
     if (hit === undefined) {
@@ -753,6 +1313,62 @@ function updateHover(controller) {
     line.scale.z = hit.distance;
 }
 
+// Show hand meshes only while their hand is tracked (otherwise they would
+// stay frozen in place), and no pointing rays for hands
+function updateHands() {
+    for (const c of [controller1, controller2]) {
+        const hand = isHand(c);
+        c.userData.handModel.visible = hand &&
+            jointPosition(c.userData.hand, "wrist") !== undefined;
+        c.userData.line.visible = !hand;
+    }
+}
+
+// While oxServe starts a (re)started run, which takes 10-20 s for a large
+// structure, show how long it has been going above the structure
+function updateStartingLabel(now) {
+    const show = ox_socket !== undefined && ox_socket.isStarting(now);
+    startingLabel.visible = show;
+    if (!show) {
+        return;
+    }
+    const seconds = Math.floor((now - ox_socket.startedAt) / 1000);
+    if (seconds !== startingLabel.userData.seconds) {
+        startingLabel.userData.seconds = seconds;
+        const ctx = startingLabel.userData.context;
+        ctx.clearRect(0, 0, 512, 96);
+        ctx.fillStyle = "rgba(20, 24, 32, 0.85)";
+        ctx.beginPath();
+        ctx.roundRect(0, 0, 512, 96, 20);
+        ctx.fill();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 36px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`Starting simulation\u2026 ${seconds} s`, 256, 50);
+        startingLabel.material.map.needsUpdate = true;
+    }
+    startingLabel.position.copy(group.position).add(LABEL_OFFSET);
+    startingLabel.lookAt(_head.setFromMatrixPosition(
+        renderer.xr.isPresenting ? renderer.xr.getCamera().matrixWorld : camera.matrixWorld
+    ));
+}
+
+function makeStartingLabel() {
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 96;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const label = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.4, 0.075),
+        new THREE.MeshBasicMaterial({map: texture, transparent: true})
+    );
+    label.userData.context = canvas.getContext("2d");
+    label.visible = false;
+    return label;
+}
+
 // Centre a controller's pull sphere on a bead
 function placePullSphere(controller, index) {
     const sphere = controller.userData.sphere;
@@ -768,7 +1384,10 @@ function updateCones() {
     for (const [controller, f] of forces) {
         system.getDisplayedPosition(f.nucId, _beadPos);
         system.instancedMesh.localToWorld(_beadPos);
-        positionCone(controller.userData.cone, f.target, _beadPos);
+        // The target moves with the structure when it is carried
+        _targetPos.copy(f.oxDNATarget);
+        system.instancedMesh.localToWorld(_targetPos);
+        positionCone(controller.userData.cone, _targetPos, _beadPos);
         placePullSphere(controller, f.nucId);
     }
 }
@@ -778,10 +1397,15 @@ function render(time, frame) {
 
     // Place the structure first: held by hand or fixed in the room
     if (renderer.xr.isPresenting) {
+        updateHands();
         pollMenuButton();
         roomAnchor.holding = grab !== undefined;
         roomAnchor.update(frame, renderer.xr.getReferenceSpace());
         if (moveMode) {
+            if (menuNeedsPlacement && leftController().userData.inputSource) {
+                placeMenu();
+            }
+            updateConnectionStatus(now);
             updatePanelHover();
             if (grab !== undefined) {
                 updateGrab();
@@ -802,7 +1426,7 @@ function render(time, frame) {
         }
     }
 
-    group.scale.lerp(targetScale, 0.01);
+    updateStartingLabel(now);
 
     keyLight.target.position.copy(group.position);
     keyLight.position.copy(group.position).add(KEY_LIGHT_OFFSET);

@@ -110,4 +110,37 @@ function parseDatTargets(datText, offsets, targets) {
     return i;
 }
 
-export {parseDatTargets};
+// Read the positions (centres of mass, where oxDNA applies external forces)
+// of some elements from an oxDNA configuration. `indices` must be sorted
+// ascending; position k is written to out[3k..3k+2]. Returns how many were
+// read.
+function readPositions(datText, indices, out) {
+    const len = datText.length;
+    let start = 0;
+    for (let l = 0; l < DAT_HEADER_LINES && start !== -1; l++) {
+        start = datText.indexOf("\n", start);
+        if (start !== -1) start++;
+    }
+    if (start === -1) {
+        return 0;
+    }
+    let line = 0, k = 0;
+    while (start < len && k < indices.length) {
+        let end = datText.indexOf("\n", start);
+        if (end === -1) end = len;
+        if (end > start) {
+            if (line === indices[k]) {
+                _parsePos[0] = start;
+                for (let d = 0; d < 3; d++) {
+                    out[3 * k + d] = parseNumber(datText, _parsePos, end);
+                }
+                k++;
+            }
+            line++;
+        }
+        start = end + 1;
+    }
+    return k;
+}
+
+export {parseDatTargets, readPositions};

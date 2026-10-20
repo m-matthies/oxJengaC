@@ -2,9 +2,12 @@ import * as THREE from "three";
 import { monomerGeometry, monomerMaterial, strandColors } from "./constants.js";
 import { parseDatTargets } from "./datParser.js";
 
-// Overestimate the time to the next frame a bit, so that the interpolation
-// rarely stalls before the next frame arrives
-const LERP_OVERSHOOT = 1.2;
+// Overestimate the time to the next frame, so that the interpolation rarely
+// stalls before the next frame arrives. oxServe frames come irregularly
+// (0.8-5.7 s apart for flippy, about 1.5 s on average). Replaying such
+// arrivals, beads stand still 30% of the time at 1.2x and 17% at 2x,
+// while reaching a frame takes 1.8 s and 2.9 s.
+const LERP_OVERSHOOT = 2;
 // Clamp interval samples to this multiple of the current estimate, so that
 // gaps (e.g. simulation restarts) do not dominate, while a too small
 // estimate still grows back geometrically
@@ -128,6 +131,13 @@ class System {
         this._startInterpolation(now);
     }
 
+    // Forget when the last frame arrived, e.g. when the simulation is
+    // restarted, so that the gap until the new run's first frame is not
+    // taken as a frame interval (the estimate itself is kept)
+    resetFrameTiming() {
+        this.lastFrameTime = undefined;
+    }
+
     _startInterpolation(now) {
         // Estimate how long until the next frame (moving average)
         if (this.lastFrameTime !== undefined) {
@@ -218,6 +228,32 @@ class System {
     // Latest simulated backbone position of an element
     getTargetPosition(index, v = new THREE.Vector3()) {
         return v.fromArray(this.targets, 3 * index);
+    }
+
+    // The element whose displayed position is closest to `point` (oxDNA
+    // coordinates), if one lies within `maxDistance`. Used for direct
+    // selection with tracked hands.
+    nearestDisplayed(point, maxDistance) {
+        // Nowhere near the structure: skip the scan (the bounding sphere
+        // covers all beads, current and target positions)
+        const sphere = this.instancedMesh.boundingSphere;
+        if (point.distanceTo(sphere.center) > sphere.radius + maxDistance) {
+            return undefined;
+        }
+        const m = this.instancedMesh.instanceMatrix.array;
+        let best;
+        let bestD2 = maxDistance * maxDistance;
+        for (let i = 0, j = 12, n = this.monomersByIndex.length; i < n; i++, j += 16) {
+            const dx = m[j] - point.x;
+            const dy = m[j + 1] - point.y;
+            const dz = m[j + 2] - point.z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 <= bestD2) {
+                bestD2 = d2;
+                best = i;
+            }
+        }
+        return best;
     }
 
     // Indices of all elements whose latest simulated backbone position lies

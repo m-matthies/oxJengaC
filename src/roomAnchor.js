@@ -12,6 +12,9 @@ import * as THREE from "three";
 // support, the reference space's reset event is used to undo recentering
 // where the runtime reports how the origin moved.
 
+// How often persisting an anchor is retried after freeing old ones
+const PERSIST_RETRIES = 2;
+
 const _resetMatrix = new THREE.Matrix4();
 const _objectMatrix = new THREE.Matrix4();
 const _scale = new THREE.Vector3();
@@ -54,7 +57,23 @@ export class RoomAnchor {
         // Set from a placement request until its anchor exists, so that the
         // old anchor does not pull the object back in the meantime
         this.pending = false;
+        // Persisted handles replaced by a newer placement. They are deleted
+        // once the newer one has been saved, so that a failed save still
+        // leaves the previous placement to restore.
+        this.staleHandles = [];
         this.onReset = (event) => this._onReset(event);
+        // Called with a short description whenever the anchor state changes
+        this.onStatus = () => {};
+        // Called with the viewer's pose (an XRRigidTransform) when there is
+        // no saved placement to restore, to put the object somewhere
+        // sensible before it is anchored there
+        this.onInitialPose = () => {};
+        this.needsInitialPose = false;
+    }
+
+    _setStatus(status) {
+        this.status = status;
+        this.onStatus(status);
     }
 
     onSessionStart(session, referenceSpace) {
@@ -62,25 +81,51 @@ export class RoomAnchor {
         this.referenceSpace = referenceSpace;
         referenceSpace.addEventListener("reset", this.onReset);
 
-        const handle = loadHandle(this.storageKey);
-        if (handle !== undefined &&
-            typeof session.restorePersistentAnchor === "function") {
+        const canPersist = typeof session.restorePersistentAnchor === "function";
+        // Anchors this site persisted earlier. Normally the one whose handle
+        // is stored; if the stored handle got lost, the first one.
+        const persisted = canPersist && session.persistentAnchors ?
+            [...session.persistentAnchors] : [];
+        let handle = loadHandle(this.storageKey);
+        if (handle === undefined && persisted.length > 0) {
+            handle = persisted[0];
+        }
+        // Drop any others, so they do not pile up against the limit
+        if (canPersist) {
+            this._deletePersistent(session, persisted.filter(other => other !== handle));
+        }
+
+        if (handle !== undefined && canPersist) {
+            this._setStatus("restoring");
             const id = ++this.placementId;
             session.restorePersistentAnchor(handle).then(anchor => {
                 if (id !== this.placementId || session !== this.session) {
                     anchor.delete();
+                    // Superseded by a placement in this session: delete the
+                    // handle once that placement is saved (right away if it
+                    // already is)
+                    if (session === this.session) {
+                        if (this.handle !== undefined) {
+                            this._deletePersistent(session, [handle]);
+                        } else {
+                            this.staleHandles.push(handle);
+                        }
+                    }
                     return;
                 }
                 this.anchor = anchor;
                 this.handle = handle;
+                saveHandle(this.storageKey, handle);
+                this._setStatus("restored");
                 console.log("Restored the structure's room anchor");
             }).catch(error => {
                 console.warn("Could not restore the room anchor", error);
                 saveHandle(this.storageKey, undefined);
-                this.requestPlacement();
+                this._deletePersistent(session, [handle]);
+                this.needsInitialPose = true;
             });
         } else {
-            this.requestPlacement();
+            this.needsInitialPose = true;
         }
     }
 
@@ -94,8 +139,10 @@ export class RoomAnchor {
         this.anchor = undefined;
         this.handle = undefined;
         this.placementRequested = false;
+        this.needsInitialPose = false;
         this.pending = false;
         this.placementId++;
+        this.staleHandles.length = 0;
     }
 
     // Anchor the object where it is now (call after moving it)
@@ -108,6 +155,14 @@ export class RoomAnchor {
     update(frame, referenceSpace) {
         if (frame === undefined || this.session === undefined) {
             return;
+        }
+        if (this.needsInitialPose) {
+            const viewer = frame.getViewerPose(referenceSpace);
+            if (viewer) {
+                this.needsInitialPose = false;
+                this.onInitialPose(viewer.transform);
+                this.requestPlacement();
+            }
         }
         if (this.placementRequested) {
             this.placementRequested = false;
@@ -127,6 +182,7 @@ export class RoomAnchor {
 
     _place(frame, referenceSpace) {
         if (typeof frame.createAnchor !== "function") {
+            this._setStatus("not supported");
             return;
         }
         const id = ++this.placementId;
@@ -147,6 +203,7 @@ export class RoomAnchor {
             this._replace(anchor);
         }).catch(error => {
             console.warn("Could not create a room anchor", error);
+            this._setStatus("failed");
         });
     }
 
@@ -159,21 +216,60 @@ export class RoomAnchor {
         if (oldAnchor !== undefined) {
             oldAnchor.delete();
         }
-        const session = this.session;
-        if (oldHandle !== undefined &&
-            typeof session.deletePersistentAnchor === "function") {
-            session.deletePersistentAnchor(oldHandle).catch(() => {});
+        if (oldHandle !== undefined) {
+            this.staleHandles.push(oldHandle);
         }
         if (typeof anchor.requestPersistentHandle === "function") {
-            anchor.requestPersistentHandle().then(handle => {
-                if (this.anchor === anchor) {
-                    this.handle = handle;
-                    saveHandle(this.storageKey, handle);
-                }
-            }).catch(error => {
-                console.warn("Could not persist the room anchor", error);
-            });
+            this._setStatus("placed");
+            this._persist(anchor, PERSIST_RETRIES);
+        } else {
+            this._setStatus("placed, not saved (unsupported)");
         }
+    }
+
+    // Persist an anchor and store its handle, so the next session can
+    // restore it. Quest allows a site only a few persistent anchors (8), so
+    // if persisting fails, all others are deleted and it is retried.
+    _persist(anchor, retries) {
+        const session = this.session;
+        anchor.requestPersistentHandle().then(handle => {
+            if (this.anchor !== anchor || session !== this.session) {
+                // Replaced while persisting: don't leave it behind
+                this._deletePersistent(session, [handle]);
+                return;
+            }
+            this.handle = handle;
+            saveHandle(this.storageKey, handle);
+            this._setStatus("saved");
+            // Only now that the new placement is saved, drop the old ones
+            this._deletePersistent(session, this.staleHandles.splice(0));
+        }).catch(error => {
+            console.warn("Could not persist the room anchor", error);
+            if (this.anchor !== anchor || session !== this.session) {
+                return;
+            }
+            if (retries > 0) {
+                this._setStatus("saving (retry)");
+                const others = session.persistentAnchors ?
+                    [...session.persistentAnchors] : [];
+                this._deletePersistent(session, others).then(() => {
+                    setTimeout(() => this._persist(anchor, retries - 1), 1000);
+                });
+            } else {
+                const reason = String((error && error.message) || error).slice(0, 40);
+                this._setStatus(`not saved: ${reason}`);
+            }
+        });
+    }
+
+    _deletePersistent(session, handles) {
+        if (session === undefined ||
+            typeof session.deletePersistentAnchor !== "function") {
+            return Promise.resolve();
+        }
+        return Promise.all(handles.map(
+            handle => session.deletePersistentAnchor(handle).catch(() => {})
+        ));
     }
 
     // Fallback without anchors: the reference space origin moved (e.g.

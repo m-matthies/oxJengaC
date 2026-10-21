@@ -19,7 +19,7 @@ import { MovePanel } from "./src/movePanel.js";
 import { RoomAnchor } from "./src/roomAnchor.js";
 import { readPositions } from "./src/datParser.js";
 import {
-    handGrabMatrix, jointPosition, pinchPoint
+    PalmButton, handGrabMatrix, jointPosition, palmFacesViewer, pinchPoint
 } from "./src/hands.js";
 
 import {
@@ -210,6 +210,13 @@ function onSelectStart(event) {
     if (isHand(controller)) {
         // Fingertips not tracked: neither a grab nor an empty-space pinch
         if (pinchPoint(controller.userData.hand, _pinch) === undefined) {
+            return;
+        }
+        // A pinch with the palm turned to the viewer is Quest's own menu
+        // gesture (or pressing our palm button), not a release
+        _head.setFromMatrixPosition(renderer.xr.getCamera().matrixWorld);
+        if (palmFacesViewer(controller.userData.hand,
+            controller.userData.inputSource.handedness, _head)) {
             return;
         }
         const direct = directPick(controller);
@@ -724,6 +731,28 @@ function pollMenuButton() {
     controller.userData.menuPressed = pressed;
 }
 
+// Open the menu with a hand: a button lies on the centre of the left palm
+// while it faces the viewer, pressed by touching it with the other hand's
+// index finger tip
+function updatePalmButton() {
+    const left = leftController();
+    if (!isHand(left)) {
+        palmButton.mesh.visible = false;
+        return;
+    }
+    const other = left === controller1 ? controller2 : controller1;
+    _head.setFromMatrixPosition(renderer.xr.getCamera().matrixWorld);
+    const source = left.userData.inputSource;
+    if (palmButton.update(left.userData.hand, source.handedness, _head, pokeTip(other))) {
+        const now = performance.now();
+        if (now - lastMenuToggle >= MENU_TOGGLE_COOLDOWN) {
+            lastMenuToggle = now;
+            setMoveMode(!moveMode);
+            pulse(other);
+        }
+    }
+}
+
 // Point rays at or poke the menu, highlight its buttons and run poked ones
 function updatePanelHover() {
     let hovered;
@@ -788,6 +817,8 @@ const forces = new Map();
 // structure with the structure's pose relative to it
 let moveMode = false;
 let movePanel;
+// The "Menu" button on the left palm (hands)
+let palmButton;
 // Set when the open menu has to be placed again (new session, or the
 // inputs switched between hands and controllers)
 let menuNeedsPlacement = false;
@@ -1245,6 +1276,7 @@ const init = () => {
         // open menu and the placement, so coming back continues where it
         // left off. Only held interactions end (no select end will come).
         stopInteractions();
+        palmButton.mesh.visible = false;
         roomAnchor.onSessionEnd();
     });
 
@@ -1317,6 +1349,8 @@ const init = () => {
     });
 
     movePanel = new MovePanel();
+    palmButton = new PalmButton();
+    scene.add(palmButton.mesh);
     startingLabel = makeStartingLabel();
     scene.add(startingLabel);
 
@@ -1615,6 +1649,7 @@ function updateFrame(time, frame, now) {
     if (renderer.xr.isPresenting) {
         updateHands();
         pollMenuButton();
+        updatePalmButton();
         roomAnchor.holding = grab !== undefined;
         roomAnchor.update(frame, renderer.xr.getReferenceSpace());
         if (moveMode) {
